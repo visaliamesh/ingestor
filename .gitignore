@@ -1,0 +1,4 @@
+# Never commit real credentials or local state
+.env
+__pycache__/
+*.pyc

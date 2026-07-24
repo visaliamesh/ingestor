@@ -1,0 +1,30 @@
+# Visalia Mesh ingestor, one container per radio.
+#
+# Setup:
+#   1. cp .env.example .env, then set API_TOKEN and CONNECTION
+#   2. docker compose up -d
+#   3. docker compose logs -f
+
+services:
+  ingestor:
+    # Build locally to test on your node. To run the published image instead,
+    # comment out build and uncomment the image line.
+    build: .
+    # image: ghcr.io/visaliamesh/ingestor:latest
+    container_name: visalia-ingestor
+    restart: unless-stopped
+    env_file: .env
+
+    # USB radios: uncomment and set your port so the container can reach it
+    # (ls /dev/ttyUSB* /dev/ttyACM* to find it). TCP/BLE radios don't need this.
+    # devices:
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+
+  # Optional. Once you're on the published image, this checks for a newer one
+  # every hour and restarts the container when it finds one.
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   command: --interval 3600 --cleanup visalia-ingestor
