@@ -481,6 +481,13 @@ def parse_connection(conn: str | None, default_tcp_port: int) -> tuple[str, str]
     if not conn:
         return "serial", ""
     c = conn.strip()
+    # potato-mesh configs often hand the radio over as a URL like
+    # http://host:port. Strip the scheme (and any trailing /path) so we're left
+    # with host[:port] for the TCP interface, otherwise it looks like a serial
+    # device path and fails with "No such file or directory".
+    m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://(.+)$", c)
+    if m:
+        return "tcp", m.group(1).split("/", 1)[0]
     if BLE_MAC.match(c):
         return "ble", c
     if c.upper().startswith("COM") or c.startswith("/dev/"):
