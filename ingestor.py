@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.1.1"     # bump on each release; logged at startup
+__version__ = "1.1.2"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -169,6 +169,23 @@ def mt_on_receive(packet, interface):  # noqa: ANN001 - meshtastic pubsub signat
         print(f"[warn] failed to handle packet: {exc}", file=sys.stderr)
 
 
+def mt_hops(packet: dict):
+    """Hops a packet travelled = hop_start - hop_limit; 0 means we heard the
+    origin directly. Both fields are needed. meshtastic omits a field that is
+    zero (proto3 default), firmware before ~2.3 doesn't send hop_start at all,
+    and some builds (seen on meshtasticd/PORTDUINO) send neither, so hops can be
+    unknown. Accept snake_case too in case a non-standard client feeds us.
+    Returns (hops|None, hop_start, hop_limit)."""
+    hs = packet.get("hopStart")
+    if hs is None:
+        hs = packet.get("hop_start")
+    hl = packet.get("hopLimit")
+    if hl is None:
+        hl = packet.get("hop_limit")
+    hops = max(hs - hl, 0) if (hs is not None and hl is not None) else None
+    return hops, hs, hl
+
+
 def mt_handle_packet(packet: dict) -> None:
     num = packet.get("from")
     if num is None:
@@ -178,11 +195,13 @@ def mt_handle_packet(packet: dict) -> None:
     portnum = decoded.get("portnum", "UNKNOWN")
     snr = packet.get("rxSnr")
     rssi = packet.get("rxRssi")
-    hop_start = packet.get("hopStart")
-    hop_limit = packet.get("hopLimit")
-    hops = None
-    if hop_start is not None and hop_limit is not None:
-        hops = max(hop_start - hop_limit, 0)
+    hops, hop_start, hop_limit = mt_hops(packet)
+    if DEBUG and hops is None:
+        # diagnoses nodes stuck at "0 direct": show the hop fields that arrived
+        # so we can see whether the firmware/build actually sends hop_start
+        dbg(f"no hops from {num} port={portnum}: hopStart={packet.get('hopStart')!r}"
+            f" hopLimit={packet.get('hopLimit')!r}"
+            f" keys={sorted(k for k in packet if k != 'decoded')}")
 
     base = {"num": num, "ts": ts, "snr": snr, "rssi": rssi, "hops": hops}
 
