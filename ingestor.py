@@ -37,16 +37,20 @@ import time
 
 import requests
 
-__version__ = "1.0.0"     # bump on each release; logged at startup
+__version__ = "1.1.0"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
 MAX_QUEUE = 5000
+STATUS_SECONDS = 300      # print a health line at least this often, even when idle
 
 events: "queue.Queue[dict]" = queue.Queue(maxsize=MAX_QUEUE)
 cfg = None
 self_num = None
 DEBUG = os.environ.get("DEBUG") == "1"
+
+# running totals for the periodic [status] line and for debugging
+STATS = {"sent": 0, "accepted": 0, "failed": 0, "dropped": 0}
 
 
 def log(msg: str) -> None:
@@ -63,7 +67,27 @@ def put(ev: dict) -> None:
     try:
         events.put_nowait(ev)
     except queue.Full:
-        print("[warn] event queue full, dropping event", file=sys.stderr)
+        STATS["dropped"] += 1
+        # the queue only fills when the dashboard has been unreachable for a
+        # while, so rate-limit this or it floods the log
+        if STATS["dropped"] % 100 == 1:
+            print(f"[warn] event queue full, dropping events"
+                  f" (total dropped {STATS['dropped']})", file=sys.stderr)
+
+
+def send_hint(exc: Exception) -> str:
+    """Turn a failed POST into a one-line pointer at the likely misconfig."""
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return "  (dashboard unreachable, check CONNECTION to the network / server URL)"
+    code = resp.status_code
+    if code in (401, 403):
+        return "  (auth rejected, check API_TOKEN)"
+    if code in (404, 405):
+        return "  (wrong path, check INSTANCE_DOMAIN, e.g. https://map.visaliamesh.com)"
+    if code >= 500:
+        return "  (dashboard server error, will retry)"
+    return ""
 
 
 def flush_loop() -> None:
@@ -71,25 +95,59 @@ def flush_loop() -> None:
     session = requests.Session()
     session.headers["Authorization"] = f"Bearer {cfg.token}"
     url = cfg.server.rstrip("/") + "/api/ingest"
+    last_status = time.time()
+    holding = False
 
     while True:
         time.sleep(FLUSH_SECONDS)
+
+        # Hold everything until we know our own node id. The dashboard credits a
+        # batch to whoever sent it; with no id it falls back to the shared token
+        # bucket, so a node's early packets would land under "community" instead
+        # of itself. The radio reports the id within a second of connecting, so
+        # this only ever holds the first flush or two. Events wait safely in the
+        # queue (bounded by MAX_QUEUE) until then.
+        if self_num is None:
+            if not holding and not events.empty():
+                log("[info] waiting for this node's id before sending; events queued")
+                holding = True
+            continue
+        if holding:
+            log(f"[ok] node id known ({self_num}); sending")
+            holding = False
+
         while len(pending) < MAX_BATCH:
             try:
                 pending.append(events.get_nowait())
             except queue.Empty:
                 break
-        if not pending:
-            continue
-        try:
-            r = session.post(url, json={"events": pending, "ingestor_node": self_num},
-                             timeout=15)
-            r.raise_for_status()
-            log(f"[ok] sent {len(pending)} events ({r.json().get('accepted')} accepted)")
-            pending = []
-        except Exception as exc:
-            print(f"[warn] send failed, will retry: {exc}", file=sys.stderr)
-            pending = pending[-MAX_BATCH * 5:]  # cap retry backlog
+
+        if pending:
+            try:
+                r = session.post(url, json={"events": pending, "ingestor_node": self_num},
+                                 timeout=15)
+                r.raise_for_status()
+                accepted = r.json().get("accepted")
+                STATS["sent"] += len(pending)
+                STATS["accepted"] += accepted or 0
+                log(f"[ok] sent {len(pending)} events ({accepted} accepted)")
+                pending = []
+            except Exception as exc:
+                STATS["failed"] += 1
+                print(f"[warn] send failed, will retry: {exc}{send_hint(exc)}",
+                      file=sys.stderr)
+                resp = getattr(exc, "response", None)
+                if DEBUG and resp is not None:
+                    dbg(f"response {resp.status_code}: {resp.text[:300]}")
+                pending = pending[-MAX_BATCH * 5:]  # cap retry backlog
+
+        # a heartbeat so operators can tell it is alive and healthy even when the
+        # radio is quiet; also the quickest read on queue depth and error counts
+        if time.time() - last_status >= STATUS_SECONDS:
+            log(f"[status] node={self_num} queued={events.qsize()}"
+                f" sent={STATS['sent']} accepted={STATS['accepted']}"
+                f" failed={STATS['failed']} dropped={STATS['dropped']}")
+            last_status = time.time()
 
 
 def real_position(lat, lon) -> bool:
@@ -549,6 +607,13 @@ def main() -> None:
     threading.Thread(target=flush_loop, daemon=True).start()
     log(f"[ok] Visalia Mesh ingestor v{__version__}: protocol={cfg.protocol}"
         f" connection={cfg.connection or 'auto serial'} server={cfg.server}")
+    # one info line with everything worth checking when something is off: the
+    # exact ingest URL, the token's last 4 (matches the dashboard's [auth] log),
+    # and whether the node id is pinned or auto-detected
+    log(f"[info] ingest {cfg.server.rstrip('/')}/api/ingest"
+        f" | token …{cfg.token[-4:]}"
+        f" | node {('pinned ' + str(self_num)) if self_num is not None else 'auto-detect'}"
+        f"{' | DEBUG on' if DEBUG else ''}")
     if cfg.protocol == "meshcore":
         run_meshcore()
     else:
