@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.1.3"     # bump on each release; logged at startup
+__version__ = "1.1.4"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -208,9 +208,14 @@ def mt_handle_packet(packet: dict) -> None:
 
     base = {"num": num, "ts": ts, "snr": snr, "rssi": rssi, "hops": hops}
 
-    # every decoded packet -> reception record (RF analytics)
-    put({**base, "type": "reception", "hop_limit": hop_limit,
-         "hop_start": hop_start, "portnum": str(portnum)})
+    # A node can't hear itself over RF: its own packets are just the API echoing
+    # back what it transmitted, so they aren't real receptions (their snr/rssi/
+    # hops are meaningless). Skip the reception record for them to keep "nodes
+    # heard" and the hop stats honest. The message/position/telemetry/nodeinfo
+    # below are still recorded, so an active node's own mesh traffic is kept.
+    if num != self_num:
+        put({**base, "type": "reception", "hop_limit": hop_limit,
+             "hop_start": hop_start, "portnum": str(portnum)})
 
     if portnum == "TEXT_MESSAGE_APP":
         put({**base, "type": "message", "text": decoded.get("text", ""),
@@ -493,8 +498,9 @@ async def mc_main() -> None:
                 if str(key)[:12].lower() not in contacts_by_prefix:
                     put({"type": "nodeinfo", "num": num, "ts": ts,
                          "node_id": f"!{str(key)[:8].lower()}"})
-                put({"type": "reception", "num": num, "ts": ts,
-                     "portnum": "ADVERTISEMENT"})
+                if num != self_num:   # our own advert echoed back is not a reception
+                    put({"type": "reception", "num": num, "ts": ts,
+                         "portnum": "ADVERTISEMENT"})
 
             def on_channel_msg(event):
                 p = event.payload or {}
@@ -508,9 +514,10 @@ async def mc_main() -> None:
                      "msg_id": mc_msg_id(ident, sender_ts, f"c{chan}", text),
                      "channel": str(chan), "text": clean,
                      "snr": p.get("snr"), "rssi": p.get("rssi")})
-                put({"type": "reception", "num": num, "ts": int(time.time()),
-                     "snr": p.get("snr"), "rssi": p.get("rssi"),
-                     "portnum": "CHANNEL_MSG"})
+                if num != self_num:   # keep our own message, but it's not a reception
+                    put({"type": "reception", "num": num, "ts": int(time.time()),
+                         "snr": p.get("snr"), "rssi": p.get("rssi"),
+                         "portnum": "CHANNEL_MSG"})
 
             def on_contact_msg(event):
                 p = event.payload or {}
