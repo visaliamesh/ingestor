@@ -59,6 +59,33 @@ If you want new versions to roll out on their own, uncomment the `watchtower`
 service in `docker-compose.yml` once you're running the published image. It
 checks for a new image hourly and restarts the container when one lands.
 
+## Reading the logs
+
+`docker compose logs -f` (or `docker logs -f <container>`). The lines to look
+for:
+
+- `[ok] ...connected, this node: <num>` means the radio is talking to it. Until
+  you see this, it hasn't reached the radio.
+- `[info] ingest <url> | token …abcd | node ...` prints at startup so you can
+  check the URL and token at a glance. The `…abcd` is the last 4 of your token,
+  which matches what the dashboard logs, so you can line the two up.
+- `[ok] sent N events (M accepted)` is a normal upload.
+- `[status] node=... queued=... sent=... failed=... dropped=...` prints every
+  few minutes, even when quiet, so you can confirm it's alive. `queued` climbing
+  and `failed` climbing together means it can't reach the dashboard.
+- `[info] waiting for this node's id before sending` shows only in the first
+  second or two after connecting, while it learns its own node number. If it
+  stays stuck there, the radio isn't reporting its id; set `INGESTOR_NODE_ID`.
+
+`[warn] send failed` lines carry a hint at the cause:
+
+- `check API_TOKEN` (403/401): the token is wrong or not on the server.
+- `check INSTANCE_DOMAIN` (404/405): the URL is wrong. It should point at the
+  server root, e.g. `https://map.visaliamesh.com`, not a page under it.
+- `dashboard unreachable`: DNS, network, or the server is down.
+
+Set `DEBUG=1` for per-packet detail and the server's response body on failures.
+
 ## License
 
 Apache 2.0, see [LICENSE](LICENSE). Same as
