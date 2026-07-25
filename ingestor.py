@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.1.2"     # bump on each release; logged at startup
+__version__ = "1.1.3"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -171,10 +171,8 @@ def mt_on_receive(packet, interface):  # noqa: ANN001 - meshtastic pubsub signat
 
 def mt_hops(packet: dict):
     """Hops a packet travelled = hop_start - hop_limit; 0 means we heard the
-    origin directly. Both fields are needed. meshtastic omits a field that is
-    zero (proto3 default), firmware before ~2.3 doesn't send hop_start at all,
-    and some builds (seen on meshtasticd/PORTDUINO) send neither, so hops can be
-    unknown. Accept snake_case too in case a non-standard client feeds us.
+    origin directly. hop_start is required (see below); hop_limit defaults to 0
+    when absent. Accept snake_case too in case a non-standard client feeds us.
     Returns (hops|None, hop_start, hop_limit)."""
     hs = packet.get("hopStart")
     if hs is None:
@@ -182,7 +180,12 @@ def mt_hops(packet: dict):
     hl = packet.get("hopLimit")
     if hl is None:
         hl = packet.get("hop_limit")
-    hops = max(hs - hl, 0) if (hs is not None and hl is not None) else None
+    # proto3 omits a field that equals 0, so an ABSENT hop_limit means 0 (the
+    # packet used up all its hops), not "unknown" — otherwise every fully
+    # relayed packet is dropped to null. hop_start is the originator's max hops
+    # and is only meaningful when > 0; with it, hops = hop_start - hop_limit
+    # (0 = heard directly). Without a real hop_start we genuinely can't tell.
+    hops = max(hs - (hl or 0), 0) if hs else None
     return hops, hs, hl
 
 
