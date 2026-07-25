@@ -27,6 +27,7 @@ Requires:  pip install meshtastic requests        (Meshtastic)
 """
 
 import argparse
+import asyncio
 import hashlib
 import os
 import queue
@@ -37,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.1.0"     # bump on each release; logged at startup
+__version__ = "1.1.1"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -384,7 +385,6 @@ def mc_msg_id(sender_identity: str, sender_ts: int, discriminator: str, text: st
 
 
 def run_meshcore() -> None:
-    import asyncio
     asyncio.run(mc_main())
 
 
