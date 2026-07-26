@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.1.4"     # bump on each release; logged at startup
+__version__ = "1.1.5"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -199,13 +199,6 @@ def mt_handle_packet(packet: dict) -> None:
     snr = packet.get("rxSnr")
     rssi = packet.get("rxRssi")
     hops, hop_start, hop_limit = mt_hops(packet)
-    if DEBUG and hops is None:
-        # diagnoses nodes stuck at "0 direct": show the hop fields that arrived
-        # so we can see whether the firmware/build actually sends hop_start
-        dbg(f"no hops from {num} port={portnum}: hopStart={packet.get('hopStart')!r}"
-            f" hopLimit={packet.get('hopLimit')!r}"
-            f" keys={sorted(k for k in packet if k != 'decoded')}")
-
     base = {"num": num, "ts": ts, "snr": snr, "rssi": rssi, "hops": hops}
 
     # A node can't hear itself over RF: its own packets are just the API echoing
@@ -214,6 +207,12 @@ def mt_handle_packet(packet: dict) -> None:
     # heard" and the hop stats honest. The message/position/telemetry/nodeinfo
     # below are still recorded, so an active node's own mesh traffic is kept.
     if num != self_num:
+        if DEBUG and hops is None:
+            # diagnoses nodes stuck at "0 direct": show the hop fields that
+            # arrived so we can see whether the firmware/build sends hop_start
+            dbg(f"no hops from {num} port={portnum}: hopStart={packet.get('hopStart')!r}"
+                f" hopLimit={packet.get('hopLimit')!r}"
+                f" keys={sorted(k for k in packet if k != 'decoded')}")
         put({**base, "type": "reception", "hop_limit": hop_limit,
              "hop_start": hop_start, "portnum": str(portnum)})
 
