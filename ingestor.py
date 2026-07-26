@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.2.1"     # bump on each release; logged at startup
+__version__ = "1.2.2"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -571,7 +571,12 @@ async def mc_main() -> None:
                 p = event.payload or {}
                 key = p.get("adv_key")
                 if not key:
-                    return   # not an advert frame (messages handled elsewhere)
+                    # not an advert; log it so we can see if channel messages
+                    # arrive here (e.g. encrypted frames we couldn't decrypt)
+                    if DEBUG:
+                        dbg(f"meshcore rx-log non-advert: type={p.get('payload_typename')}"
+                            f" snr={p.get('snr')} path_len={p.get('path_len')} keys={sorted(p.keys())}")
+                    return
                 num = mc_num(key)
                 if num is None:
                     return
@@ -593,16 +598,17 @@ async def mc_main() -> None:
 
             def on_channel_msg(event):
                 p = event.payload or {}
-                text = p.get("text") or ""
+                text = p.get("text") or p.get("msg") or p.get("message") or ""
+                num, ident, clean = (sender_from_channel_text(text) if text
+                                     else (None, "", ""))
+                snr, rssi, hops, path = mc_rf(p)
+                if DEBUG:   # fire always so we can see events that arrive empty
+                    dbg(f"meshcore channel-msg: text={text[:48]!r} sender={num}"
+                        f" snr={snr} path_len={p.get('path_len')} keys={sorted(p.keys())}")
                 if not text:
                     return
-                num, ident, clean = sender_from_channel_text(text)
                 chan = p.get("channel_idx", 0)
                 sender_ts = int(p.get("timestamp") or time.time())
-                snr, rssi, hops, path = mc_rf(p)
-                if DEBUG:
-                    dbg(f"meshcore channel rf: snr={snr} rssi={rssi} path_len={p.get('path_len')}"
-                        f" hops={hops} keys={sorted(p.keys())}")
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(ident, sender_ts, f"c{chan}", text),
                      "channel": str(chan), "text": clean, "snr": snr, "rssi": rssi})
