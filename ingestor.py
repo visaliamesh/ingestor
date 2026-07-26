@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.2.0"     # bump on each release; logged at startup
+__version__ = "1.2.1"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -545,6 +545,13 @@ async def mc_main() -> None:
             except Exception as exc:
                 dbg(f"meshcore channel registration unavailable, RF metrics limited: {exc}")
 
+            # When the RX_LOG_DATA stream is available it carries the RF metrics
+            # for adverts (snr/rssi/path_len), so it becomes the authoritative
+            # "heard" record. The bare ADVERTISEMENT event then only does node
+            # discovery. If RX_LOG_DATA isn't available, ADVERTISEMENT falls back
+            # to a plain (no-RF) reception so "nodes heard" never regresses.
+            rx_log_ok = False
+
             def on_advert(event):
                 p = event.payload
                 key = p.get("public_key") if isinstance(p, dict) else p
@@ -552,13 +559,37 @@ async def mc_main() -> None:
                 if num is None:
                     return
                 ts = int(time.time())
-                # name-optional "node was heard" upsert + reception record
                 if str(key)[:12].lower() not in contacts_by_prefix:
                     put({"type": "nodeinfo", "num": num, "ts": ts,
                          "node_id": f"!{str(key)[:8].lower()}"})
-                if num != self_num:   # our own advert echoed back is not a reception
+                if not rx_log_ok and num != self_num:   # RX-log covers RF; this is the fallback
                     put({"type": "reception", "num": num, "ts": ts,
                          "portnum": "ADVERTISEMENT"})
+
+            def on_rx_log(event):
+                # raw received frames with RF metrics; advert frames carry adv_key
+                p = event.payload or {}
+                key = p.get("adv_key")
+                if not key:
+                    return   # not an advert frame (messages handled elsewhere)
+                num = mc_num(key)
+                if num is None:
+                    return
+                ts = int(time.time())
+                snr, rssi = p.get("snr"), p.get("rssi")
+                hops = mc_hops(p.get("path_len"))
+                if DEBUG:
+                    dbg(f"meshcore rx-log advert: snr={snr} rssi={rssi}"
+                        f" path_len={p.get('path_len')} hops={hops} keys={sorted(p.keys())}")
+                if str(key)[:12].lower() not in contacts_by_prefix:
+                    put({"type": "nodeinfo", "num": num, "ts": ts,
+                         "node_id": f"!{str(key)[:8].lower()}"})
+                lat, lon = p.get("adv_lat"), p.get("adv_lon")
+                if real_position(lat, lon):
+                    put({"type": "position", "num": num, "ts": ts, "lat": lat, "lon": lon})
+                if num != self_num:
+                    put({"type": "reception", "num": num, "ts": ts, "snr": snr,
+                         "rssi": rssi, "hops": hops, "portnum": "ADVERTISEMENT"})
 
             def on_channel_msg(event):
                 p = event.payload or {}
@@ -599,6 +630,15 @@ async def mc_main() -> None:
             mc.subscribe(EventType.ADVERTISEMENT, on_advert)
             mc.subscribe(EventType.CHANNEL_MSG_RECV, on_channel_msg)
             mc.subscribe(EventType.CONTACT_MSG_RECV, on_contact_msg)
+            # RX_LOG_DATA is the raw-frame stream that carries advert RF metrics;
+            # subscribing flips on_advert to node-discovery-only. Guarded so an
+            # older meshcore lib without the event just uses the plain fallback.
+            try:
+                mc.subscribe(EventType.RX_LOG_DATA, on_rx_log)
+                rx_log_ok = True
+                log("[ok] meshcore RX-log subscribed (advert RF metrics enabled)")
+            except Exception as exc:
+                dbg(f"meshcore RX_LOG_DATA unavailable, advert RF limited: {exc}")
 
             # periodic self battery -> telemetry
             while True:
