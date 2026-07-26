@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.2.2"     # bump on each release; logged at startup
+__version__ = "1.2.3"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -524,15 +524,13 @@ async def mc_main() -> None:
                     upsert_contact(str(key), c)
             log(f"[ok] seeded {len(contacts)} meshcore contacts")
 
-            # Turn on the library's RX-log <-> message join so CHANNEL_MSG_RECV
-            # events carry SNR/RSSI/path (and thus hops). It needs each channel's
-            # secret registered, so fetch every channel first. All best-effort:
-            # older library versions may lack these calls, in which case MeshCore
-            # still works, just without per-packet RF metrics.
-            try:
-                mc.decrypt_channels = True
-            except Exception:
-                pass
+            # Turn on the library's channel-log decryption so encrypted group
+            # messages (GRP_TXT frames) get decrypted and delivered as
+            # CHANNEL_MSG_RECV events, and the RX-log join adds SNR/RSSI/path.
+            # NOTE: the API is a METHOD (set_decrypt_channel_logs), not a
+            # `decrypt_channels` attribute — setting the attribute is a silent
+            # no-op. It also needs each channel's secret registered, so fetch
+            # every channel first. All best-effort so older libs degrade cleanly.
             try:
                 res = await mc.commands.send_device_query()
                 maxch = int((getattr(res, "payload", {}) or {}).get("max_channels") or 8)
@@ -541,9 +539,16 @@ async def mc_main() -> None:
                         await mc.commands.get_channel(idx)
                     except Exception:
                         break
-                log(f"[ok] meshcore channels registered (RF metrics enabled)")
+                log(f"[ok] meshcore channels registered")
             except Exception as exc:
-                dbg(f"meshcore channel registration unavailable, RF metrics limited: {exc}")
+                dbg(f"meshcore channel registration unavailable: {exc}")
+            try:
+                res = mc.set_decrypt_channel_logs(True)
+                if asyncio.iscoroutine(res):
+                    await res
+                log("[ok] meshcore channel-log decryption enabled")
+            except Exception as exc:
+                dbg(f"meshcore set_decrypt_channel_logs unavailable: {exc}")
 
             # When the RX_LOG_DATA stream is available it carries the RF metrics
             # for adverts (snr/rssi/path_len), so it becomes the authoritative
