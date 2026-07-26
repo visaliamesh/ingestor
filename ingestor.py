@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.1.6"     # bump on each release; logged at startup
+__version__ = "1.2.0"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -381,6 +381,43 @@ def run_meshtastic() -> None:
 # MeshCore adv types -> role names (matches the PotatoMesh contract)
 MC_ROLES = {1: "COMPANION", 2: "REPEATER", 3: "ROOM_SERVER", 4: "SENSOR"}
 
+MC_DIRECT_PATH_LEN = 255   # MeshCore path_len sentinel: heard directly = 0 hops
+
+
+def _mc_first(p: dict, *keys):
+    """First non-None value among keys — the RX-log join surfaces SNR/RSSI in
+    upper-case, but be tolerant of either casing across library versions."""
+    for k in keys:
+        v = p.get(k)
+        if v is not None:
+            return v
+    return None
+
+
+def mc_hops(path_len) -> int | None:
+    """MeshCore path_len -> hops travelled. 255 (the direct sentinel) or 0 mean
+    heard directly (0 hops); 1..254 is that many relay hops; else unknown."""
+    if path_len is None:
+        return None
+    try:
+        v = int(path_len)
+    except (TypeError, ValueError):
+        return None
+    if v == MC_DIRECT_PATH_LEN:
+        return 0
+    return v if v >= 0 else None
+
+
+def mc_rf(p: dict):
+    """Pull (snr, rssi, hops, path) from a MeshCore event payload. Populated
+    once decrypt_channels is on and channel secrets are registered so the
+    library joins each message to its RX-log frame."""
+    snr = _mc_first(p, "SNR", "snr")
+    rssi = _mc_first(p, "RSSI", "rssi")
+    hops = mc_hops(p.get("path_len"))
+    path = p.get("path")
+    return snr, rssi, hops, (path.lower() if isinstance(path, str) and path else None)
+
 
 def mc_num(pubkey: str | None) -> int | None:
     """Map a MeshCore public key (hex) into 32-bit node-number space."""
@@ -487,6 +524,27 @@ async def mc_main() -> None:
                     upsert_contact(str(key), c)
             log(f"[ok] seeded {len(contacts)} meshcore contacts")
 
+            # Turn on the library's RX-log <-> message join so CHANNEL_MSG_RECV
+            # events carry SNR/RSSI/path (and thus hops). It needs each channel's
+            # secret registered, so fetch every channel first. All best-effort:
+            # older library versions may lack these calls, in which case MeshCore
+            # still works, just without per-packet RF metrics.
+            try:
+                mc.decrypt_channels = True
+            except Exception:
+                pass
+            try:
+                res = await mc.commands.send_device_query()
+                maxch = int((getattr(res, "payload", {}) or {}).get("max_channels") or 8)
+                for idx in range(max(1, min(maxch, 32))):
+                    try:
+                        await mc.commands.get_channel(idx)
+                    except Exception:
+                        break
+                log(f"[ok] meshcore channels registered (RF metrics enabled)")
+            except Exception as exc:
+                dbg(f"meshcore channel registration unavailable, RF metrics limited: {exc}")
+
             def on_advert(event):
                 p = event.payload
                 key = p.get("public_key") if isinstance(p, dict) else p
@@ -510,14 +568,16 @@ async def mc_main() -> None:
                 num, ident, clean = sender_from_channel_text(text)
                 chan = p.get("channel_idx", 0)
                 sender_ts = int(p.get("timestamp") or time.time())
+                snr, rssi, hops, path = mc_rf(p)
+                if DEBUG:
+                    dbg(f"meshcore channel rf: snr={snr} rssi={rssi} path_len={p.get('path_len')}"
+                        f" hops={hops} keys={sorted(p.keys())}")
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(ident, sender_ts, f"c{chan}", text),
-                     "channel": str(chan), "text": clean,
-                     "snr": p.get("snr"), "rssi": p.get("rssi")})
+                     "channel": str(chan), "text": clean, "snr": snr, "rssi": rssi})
                 if num != self_num:   # keep our own message, but it's not a reception
                     put({"type": "reception", "num": num, "ts": int(time.time()),
-                         "snr": p.get("snr"), "rssi": p.get("rssi"),
-                         "portnum": "CHANNEL_MSG"})
+                         "snr": snr, "rssi": rssi, "hops": hops, "portnum": "CHANNEL_MSG"})
 
             def on_contact_msg(event):
                 p = event.payload or {}
@@ -527,10 +587,14 @@ async def mc_main() -> None:
                 if not text or num is None:
                     return
                 sender_ts = int(p.get("timestamp") or time.time())
+                snr, rssi, hops, path = mc_rf(p)
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(prefix, sender_ts, "dm", text),
                      "channel": "dm", "to": self_num, "text": text,
-                     "snr": p.get("snr"), "rssi": p.get("rssi")})
+                     "snr": snr, "rssi": rssi})
+                if num != self_num:
+                    put({"type": "reception", "num": num, "ts": int(time.time()),
+                         "snr": snr, "rssi": rssi, "hops": hops, "portnum": "CONTACT_MSG"})
 
             mc.subscribe(EventType.ADVERTISEMENT, on_advert)
             mc.subscribe(EventType.CHANNEL_MSG_RECV, on_channel_msg)
