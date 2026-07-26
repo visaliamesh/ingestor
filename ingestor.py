@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.1.5"     # bump on each release; logged at startup
+__version__ = "1.1.6"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -125,7 +125,8 @@ def flush_loop() -> None:
 
         if pending:
             try:
-                r = session.post(url, json={"events": pending, "ingestor_node": self_num},
+                r = session.post(url, json={"events": pending, "ingestor_node": self_num,
+                                            "ingestor_version": __version__},
                                  timeout=15)
                 r.raise_for_status()
                 accepted = r.json().get("accepted")
