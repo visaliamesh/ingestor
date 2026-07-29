@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.2.5"     # bump on each release; logged at startup
+__version__ = "1.3.0"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -63,8 +63,33 @@ def dbg(msg: str) -> None:
         print(f"[debug] {msg}", flush=True)
 
 
+def channel_allowed(name) -> bool:
+    """Potato-compatible channel gate. ALLOWED_CHANNELS is a name whitelist,
+    HIDDEN_CHANNELS a name blacklist, both case-insensitive. A None/unknown
+    channel passes (fail-open) so a name-resolution miss can never silently
+    discard every packet — only channels we can actually name get filtered."""
+    allowed = getattr(cfg, "allowed_channels", None) or set()
+    hidden = getattr(cfg, "hidden_channels", None) or set()
+    if not allowed and not hidden:
+        return True
+    if name is None:
+        return True
+    n = str(name).strip().lower()
+    if allowed and n not in allowed:
+        return False
+    if n in hidden:
+        return False
+    return True
+
+
 def put(ev: dict) -> None:
     ev.setdefault("network", cfg.protocol)
+    # potato-compatible MIN_SNR: drop packets weaker than the floor. Events with
+    # no SNR (roster nodeinfo, self telemetry) carry None and always pass.
+    mn = getattr(cfg, "min_snr", None)
+    snr = ev.get("snr")
+    if mn is not None and isinstance(snr, (int, float)) and snr < mn:
+        return
     try:
         events.put_nowait(ev)
     except queue.Full:
@@ -194,6 +219,13 @@ def mt_handle_packet(packet: dict) -> None:
     num = packet.get("from")
     if num is None:
         return
+    # potato-compatible ALLOWED/HIDDEN_CHANNELS: discard the WHOLE packet when
+    # it arrived on a channel we're not accepting (by real name; falls open if
+    # the name is unknown). chan_name is also used to label the message below.
+    chan_idx = packet.get("channel", 0)
+    chan_name = mt_channel_names.get(chan_idx)
+    if not channel_allowed(chan_name):
+        return
     ts = int(time.time())
     decoded = packet.get("decoded", {})
     portnum = decoded.get("portnum", "UNKNOWN")
@@ -218,8 +250,11 @@ def mt_handle_packet(packet: dict) -> None:
              "hop_start": hop_start, "portnum": str(portnum)})
 
     if portnum == "TEXT_MESSAGE_APP":
+        # prefer the real channel name so a non-primary radio (e.g. a MediumFast
+        # primary) isn't relabeled by the server's index->name map; fall back to
+        # the index when the name is unknown (server maps it via DASH_CHANNEL_NAMES)
         put({**base, "type": "message", "text": decoded.get("text", ""),
-             "to": packet.get("to"), "channel": packet.get("channel", 0),
+             "to": packet.get("to"), "channel": chan_name if chan_name else chan_idx,
              "msg_id": packet.get("id"),
              "reply_id": decoded.get("replyId"), "emoji": decoded.get("emoji")})
 
@@ -348,6 +383,43 @@ def mt_connect(conn: str | None):
     return meshtastic.serial_interface.SerialInterface(devPath=target or None)
 
 
+# Meshtastic modem preset -> the name an UNNAMED primary channel shows in the
+# app (an empty primary on LONG_FAST is "LongFast"). Lets ALLOWED_CHANNELS match
+# by name even though the packet only carries the channel index.
+MT_PRESET_NAMES = {0: "LongFast", 1: "LongSlow", 2: "VeryLongSlow", 3: "MediumSlow",
+                   4: "MediumFast", 5: "ShortSlow", 6: "ShortFast", 7: "LongMod",
+                   8: "ShortTurbo"}
+
+mt_channel_names: dict[int, str] = {}
+
+
+def mt_load_channels(iface) -> None:
+    """Build channel index -> real name from the radio so ALLOWED/HIDDEN_CHANNELS
+    can filter by name. Best-effort: any failure leaves the map empty, which
+    makes channel_allowed() fail open (no filtering) rather than drop everything."""
+    mt_channel_names.clear()
+    try:
+        preset = None
+        try:
+            preset = int(iface.localConfig.lora.modem_preset)
+        except Exception:
+            pass
+        default_primary = MT_PRESET_NAMES.get(preset, "LongFast")
+        for i, ch in enumerate(getattr(iface.localNode, "channels", None) or []):
+            role = int(getattr(ch, "role", 0))   # 0 DISABLED, 1 PRIMARY, 2 SECONDARY
+            if role == 0:
+                continue
+            name = getattr(getattr(ch, "settings", None), "name", "") or ""
+            if not name and role == 1:            # unnamed primary -> preset name
+                name = default_primary
+            if name:
+                mt_channel_names[i] = name
+    except Exception as exc:
+        dbg(f"meshtastic channel-name map unavailable: {exc}")
+    if getattr(cfg, "allowed_channels", None) or getattr(cfg, "hidden_channels", None):
+        log(f"[ok] meshtastic channels: {mt_channel_names or 'unknown (filter fails open)'}")
+
+
 def run_meshtastic() -> None:
     global self_num
     from pubsub import pub
@@ -359,6 +431,7 @@ def run_meshtastic() -> None:
             info = iface.getMyNodeInfo() or {}
             self_num = info.get("num")
             log(f"[ok] meshtastic connected, this node: {self_num}")
+            mt_load_channels(iface)        # resolve channel names for filtering
             mt_seed_nodedb(iface)
             mt_self_report(iface)          # report our own health right away
             last_self = time.time()
@@ -637,6 +710,8 @@ async def mc_main() -> None:
                 # label by real channel name ("Public"); fingerprint stays keyed
                 # on the index so it's stable regardless of naming
                 chan = channel_names.get(chan_idx) or str(chan_idx)
+                if not channel_allowed(chan):   # potato ALLOWED/HIDDEN_CHANNELS
+                    return
                 sender_ts = int(p.get("timestamp") or time.time())
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(ident, sender_ts, f"c{chan_idx}", text),
@@ -798,6 +873,30 @@ def main() -> None:
                         else int(node_id_env, 0)) & 0xFFFFFFFF
         except ValueError:
             log(f"[warn] INGESTOR_NODE_ID={node_id_env!r} is not a valid node id, ignoring")
+
+    # potato-compatible packet filters (ingestor-side, per-listener):
+    #   ALLOWED_CHANNELS - whitelist of channel NAMES; packets on any other
+    #                      channel are discarded before sending (empty = accept all)
+    #   HIDDEN_CHANNELS  - channel NAMES to drop when forwarding
+    #   MIN_SNR          - drop packets whose SNR is below this floor (dB)
+    #   RX_ONLY          - accepted for compat; this ingestor is receive-only and
+    #                      never transmits to the mesh, so it is a no-op here
+    def _chan_set(name):
+        return {c.strip().lower() for c in os.environ.get(name, "").split(",") if c.strip()}
+    cfg.allowed_channels = _chan_set("ALLOWED_CHANNELS")
+    cfg.hidden_channels = _chan_set("HIDDEN_CHANNELS")
+    mn = os.environ.get("MIN_SNR", "").strip()
+    try:
+        cfg.min_snr = float(mn) if mn else None
+    except ValueError:
+        cfg.min_snr = None
+        log(f"[warn] MIN_SNR={mn!r} is not a number, ignoring")
+    cfg.rx_only = os.environ.get("RX_ONLY", "").strip().lower() in ("1", "true", "yes")
+    if cfg.allowed_channels or cfg.hidden_channels or cfg.min_snr is not None:
+        log(f"[info] filters: allowed_channels={sorted(cfg.allowed_channels) or 'all'}"
+            f" hidden_channels={sorted(cfg.hidden_channels) or 'none'} min_snr={cfg.min_snr}")
+    if cfg.rx_only:
+        log("[info] RX_ONLY set — noted; this ingestor never transmits to the mesh anyway")
 
     threading.Thread(target=flush_loop, daemon=True).start()
     log(f"[ok] Visalia Mesh ingestor v{__version__}: protocol={cfg.protocol}"

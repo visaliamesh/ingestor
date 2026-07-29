@@ -44,12 +44,21 @@ Set these in `.env` (or the environment):
   a `host[:port]` for TCP, or a MAC for BLE
 - `PROTOCOL`: `meshtastic` (default) or `meshcore`
 - `DEBUG`: `1` for verbose logs
+- `ALLOWED_CHANNELS`: whitelist of channel **names** (e.g. `LongFast,Visalia`);
+  packets on any other channel are discarded. Blank = accept all. Matched by
+  name, case-insensitive; an unnamed primary channel resolves to its modem-preset
+  name (`LongFast`, `MediumFast`, …)
+- `HIDDEN_CHANNELS`: channel names to drop when forwarding (blacklist)
+- `MIN_SNR`: drop packets weaker than this SNR floor in dB (blank = keep all)
+- `RX_ONLY`: accepted for potato compatibility but a no-op — this ingestor is
+  receive-only and never transmits to the mesh
 
 ## Coming from potato-mesh
 
 It reads potato's environment variables (`INSTANCE_DOMAIN`, `API_TOKEN`,
-`CONNECTION`, `PROTOCOL`, `DEBUG`, `INGESTOR_NODE_ID`), so an existing potato
-`.env` works as-is. Set `INSTANCE_DOMAIN` to this server, swap the image for
+`CONNECTION`, `PROTOCOL`, `DEBUG`, `INGESTOR_NODE_ID`, `ALLOWED_CHANNELS`,
+`HIDDEN_CHANNELS`, `MIN_SNR`, `RX_ONLY`), so an existing potato `.env` works
+as-is. Set `INSTANCE_DOMAIN` to this server, swap the image for
 `ghcr.io/visaliamesh/ingestor:latest`, and restart. Your node keeps reporting
 the same data, plus traceroutes with real endpoints.
 
