@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.2.3"     # bump on each release; logged at startup
+__version__ = "1.2.4"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -459,6 +459,9 @@ async def mc_main() -> None:
     kind, target = parse_connection(cfg.connection, default_tcp_port=5000)
     contacts_by_name: dict[str, dict] = {}
     contacts_by_prefix: dict[str, dict] = {}
+    # per-window activity, reset every heartbeat, so a quiet radio is obvious at
+    # a glance instead of hiding behind a stream of self-echo adverts
+    heard = {"self_adv": 0, "chan_msg": 0, "dm_msg": 0, "peers": set()}
 
     def upsert_contact(key: str, c: dict) -> None:
         num = mc_num(key)
@@ -534,12 +537,19 @@ async def mc_main() -> None:
             try:
                 res = await mc.commands.send_device_query()
                 maxch = int((getattr(res, "payload", {}) or {}).get("max_channels") or 8)
+                names = []
                 for idx in range(max(1, min(maxch, 32))):
                     try:
-                        await mc.commands.get_channel(idx)
+                        r = await mc.commands.get_channel(idx)
+                        pl = getattr(r, "payload", {}) or {}
+                        cn = pl.get("channel_name") or pl.get("name")
+                        if cn:
+                            names.append(f"{idx}:{cn}")
                     except Exception:
                         break
-                log(f"[ok] meshcore channels registered")
+                # names lets us confirm the "public" channel is registered — a
+                # channel must be registered here for its group texts to decrypt
+                log(f"[ok] meshcore channels registered: {names or maxch}")
             except Exception as exc:
                 dbg(f"meshcore channel registration unavailable: {exc}")
             try:
@@ -561,13 +571,13 @@ async def mc_main() -> None:
                 p = event.payload
                 key = p.get("public_key") if isinstance(p, dict) else p
                 num = mc_num(key)
-                if num is None:
-                    return
+                if num is None or num == self_num:
+                    return   # our own advert, echoed back by a neighbor: not a peer
                 ts = int(time.time())
                 if str(key)[:12].lower() not in contacts_by_prefix:
                     put({"type": "nodeinfo", "num": num, "ts": ts,
                          "node_id": f"!{str(key)[:8].lower()}"})
-                if not rx_log_ok and num != self_num:   # RX-log covers RF; this is the fallback
+                if not rx_log_ok:   # RX-log covers RF; this is the fallback
                     put({"type": "reception", "num": num, "ts": ts,
                          "portnum": "ADVERTISEMENT"})
 
@@ -588,18 +598,23 @@ async def mc_main() -> None:
                 ts = int(time.time())
                 snr, rssi = p.get("snr"), p.get("rssi")
                 hops = mc_hops(p.get("path_len"))
+                is_self = (num == self_num)
                 if DEBUG:
-                    dbg(f"meshcore rx-log advert: snr={snr} rssi={rssi}"
-                        f" path_len={p.get('path_len')} hops={hops} keys={sorted(p.keys())}")
+                    dbg(f"meshcore rx-log advert: num={num} self={is_self} snr={snr}"
+                        f" rssi={rssi} path_len={p.get('path_len')} hops={hops}"
+                        f" key={str(key)[:8].lower()}")
+                if is_self:
+                    heard["self_adv"] += 1
+                    return   # our own advert, echoed back by a neighbor: not a reception
+                heard["peers"].add(num)
                 if str(key)[:12].lower() not in contacts_by_prefix:
                     put({"type": "nodeinfo", "num": num, "ts": ts,
                          "node_id": f"!{str(key)[:8].lower()}"})
                 lat, lon = p.get("adv_lat"), p.get("adv_lon")
                 if real_position(lat, lon):
                     put({"type": "position", "num": num, "ts": ts, "lat": lat, "lon": lon})
-                if num != self_num:
-                    put({"type": "reception", "num": num, "ts": ts, "snr": snr,
-                         "rssi": rssi, "hops": hops, "portnum": "ADVERTISEMENT"})
+                put({"type": "reception", "num": num, "ts": ts, "snr": snr,
+                     "rssi": rssi, "hops": hops, "portnum": "ADVERTISEMENT"})
 
             def on_channel_msg(event):
                 p = event.payload or {}
@@ -612,6 +627,7 @@ async def mc_main() -> None:
                         f" snr={snr} path_len={p.get('path_len')} keys={sorted(p.keys())}")
                 if not text:
                     return
+                heard["chan_msg"] += 1
                 chan = p.get("channel_idx", 0)
                 sender_ts = int(p.get("timestamp") or time.time())
                 put({"type": "message", "num": num, "ts": int(time.time()),
@@ -628,6 +644,7 @@ async def mc_main() -> None:
                 num = mc_num(prefix)
                 if not text or num is None:
                     return
+                heard["dm_msg"] += 1
                 sender_ts = int(p.get("timestamp") or time.time())
                 snr, rssi, hops, path = mc_rf(p)
                 put({"type": "message", "num": num, "ts": int(time.time()),
@@ -651,17 +668,43 @@ async def mc_main() -> None:
             except Exception as exc:
                 dbg(f"meshcore RX_LOG_DATA unavailable, advert RF limited: {exc}")
 
-            # periodic self battery -> telemetry
+            # CRUCIAL: CHANNEL_MSG_RECV / CONTACT_MSG_RECV only fire for our
+            # subscribers once the device's decrypted message queue is drained.
+            # The device queues the messages it decrypted (Public channel + DMs to
+            # us) and raises "messages_waiting"; without auto-fetch we'd only ever
+            # see the raw, still-encrypted GRP_TXT/TEXT_MSG frames in the RX-log and
+            # store nothing. This starts the drain loop that turns them into events.
+            try:
+                res = mc.start_auto_message_fetching()
+                if asyncio.iscoroutine(res):
+                    await res
+                log("[ok] meshcore auto message fetching started")
+            except Exception as exc:
+                dbg(f"meshcore start_auto_message_fetching unavailable: {exc}")
+
+            # heartbeat + periodic self battery. Tick every 60 s so a quiet radio
+            # shows up quickly; poll battery only every 10th tick (~10 min).
+            tick = 0
             while True:
-                try:
-                    res = await mc.commands.get_bat()
-                    level = (getattr(res, "payload", {}) or {}).get("level")
-                    if level is not None and self_num is not None:
-                        put({"type": "telemetry", "num": self_num,
-                             "ts": int(time.time()), "battery": level})
-                except Exception as exc:
-                    dbg(f"battery poll failed: {exc}")
-                await asyncio.sleep(600)
+                if tick % 10 == 0:
+                    try:
+                        res = await mc.commands.get_bat()
+                        level = (getattr(res, "payload", {}) or {}).get("level")
+                        if level is not None and self_num is not None:
+                            put({"type": "telemetry", "num": self_num,
+                                 "ts": int(time.time()), "battery": level})
+                    except Exception as exc:
+                        dbg(f"battery poll failed: {exc}")
+                # one-line summary of what we actually HEARD this window: distinct
+                # peers, channel/DM messages, and self-echo count. All zeros but a
+                # high self_adv count = only hearing our own advert reflected back.
+                log(f"[heard] peers={len(heard['peers'])} chan_msgs={heard['chan_msg']}"
+                    f" dms={heard['dm_msg']} self_echo={heard['self_adv']}"
+                    + (f" peer_nums={sorted(heard['peers'])}" if heard["peers"] else ""))
+                heard["peers"].clear()
+                heard["self_adv"] = heard["chan_msg"] = heard["dm_msg"] = 0
+                tick += 1
+                await asyncio.sleep(60)
 
         except KeyboardInterrupt:
             return
