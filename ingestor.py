@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.2.4"     # bump on each release; logged at startup
+__version__ = "1.2.5"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -459,6 +459,10 @@ async def mc_main() -> None:
     kind, target = parse_connection(cfg.connection, default_tcp_port=5000)
     contacts_by_name: dict[str, dict] = {}
     contacts_by_prefix: dict[str, dict] = {}
+    # channel_idx -> real name (e.g. 0 -> "Public"), filled at registration; used
+    # to label messages by their true channel instead of the server's meshtastic
+    # slot map turning index 0 into "LongFast"
+    channel_names: dict[int, str] = {}
     # per-window activity, reset every heartbeat, so a quiet radio is obvious at
     # a glance instead of hiding behind a stream of self-echo adverts
     heard = {"self_adv": 0, "chan_msg": 0, "dm_msg": 0, "peers": set()}
@@ -544,6 +548,7 @@ async def mc_main() -> None:
                         pl = getattr(r, "payload", {}) or {}
                         cn = pl.get("channel_name") or pl.get("name")
                         if cn:
+                            channel_names[idx] = cn
                             names.append(f"{idx}:{cn}")
                     except Exception:
                         break
@@ -628,11 +633,14 @@ async def mc_main() -> None:
                 if not text:
                     return
                 heard["chan_msg"] += 1
-                chan = p.get("channel_idx", 0)
+                chan_idx = p.get("channel_idx", 0)
+                # label by real channel name ("Public"); fingerprint stays keyed
+                # on the index so it's stable regardless of naming
+                chan = channel_names.get(chan_idx) or str(chan_idx)
                 sender_ts = int(p.get("timestamp") or time.time())
                 put({"type": "message", "num": num, "ts": int(time.time()),
-                     "msg_id": mc_msg_id(ident, sender_ts, f"c{chan}", text),
-                     "channel": str(chan), "text": clean, "snr": snr, "rssi": rssi})
+                     "msg_id": mc_msg_id(ident, sender_ts, f"c{chan_idx}", text),
+                     "channel": chan, "text": clean, "snr": snr, "rssi": rssi})
                 if num != self_num:   # keep our own message, but it's not a reception
                     put({"type": "reception", "num": num, "ts": int(time.time()),
                          "snr": snr, "rssi": rssi, "hops": hops, "portnum": "CHANNEL_MSG"})
