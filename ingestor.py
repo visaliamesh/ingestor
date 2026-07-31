@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.1"     # bump on each release; logged at startup
+__version__ = "1.3.2"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -307,10 +307,29 @@ def mt_handle_packet(packet: dict) -> None:
             put({**base, "type": "neighbors", "neighbors": neighbors})
 
 
+def mt_radio_info(iface):
+    """This node's LoRa config for its ingestor card: (modem_preset_name, freq_mhz).
+    Preset name matches the firmware's DisplayFormatters output (LongFast, ...).
+    Frequency is only reported when the node pins override_frequency; the channel
+    frequency the firmware derives from region+preset+channel-hash isn't reliably
+    reproducible here, so it's left null rather than guessed (cosmetic field)."""
+    preset = freq = None
+    try:
+        lora = iface.localConfig.lora
+        if getattr(lora, "use_preset", True):
+            preset = MT_PRESET_NAMES.get(int(getattr(lora, "modem_preset", -1)))
+        ov = float(getattr(lora, "override_frequency", 0) or 0)
+        if ov > 0:
+            freq = round(ov, 4)
+    except Exception as exc:
+        dbg(f"radio info unavailable: {exc}")
+    return preset, freq
+
+
 def mt_self_report(iface) -> None:
     """Report this node's own health (firmware, battery, channel/air util,
-    uptime) so the dashboard has context for what it does and doesn't hear.
-    Sent at connect and every 5 minutes after."""
+    uptime) plus its radio config (modem preset, frequency) so the dashboard has
+    context for what it does and doesn't hear. Sent at connect and every 5 min."""
     try:
         info = iface.getMyNodeInfo() or {}
         num = info.get("num")
@@ -323,13 +342,15 @@ def mt_self_report(iface) -> None:
         if meta is not None:
             fw = getattr(meta, "firmware_version", None) or getattr(meta, "firmwareVersion", None)
         dev = info.get("deviceMetrics") or {}
+        preset, lora_freq = mt_radio_info(iface)
         put({"type": "nodeinfo", "num": num, "ts": int(time.time()),
              "node_id": user.get("id"), "long_name": user.get("longName"),
              "short_name": user.get("shortName"),
              "hw_model": str(user.get("hwModel", "")) or None,
              "role": str(user.get("role", "")) or None,
              "firmware": str(fw) if fw else None,
-             "uptime_seconds": dev.get("uptimeSeconds")})
+             "uptime_seconds": dev.get("uptimeSeconds"),
+             "modem_preset": preset, "lora_freq": lora_freq})
         if dev:
             put({"type": "telemetry", "num": num, "ts": int(time.time()),
                  "battery": dev.get("batteryLevel"), "voltage": dev.get("voltage"),
