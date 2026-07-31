@@ -67,7 +67,7 @@ def channel_allowed(name) -> bool:
     """Potato-compatible channel gate. ALLOWED_CHANNELS is a name whitelist,
     HIDDEN_CHANNELS a name blacklist, both case-insensitive. A None/unknown
     channel passes (fail-open) so a name-resolution miss can never silently
-    discard every packet — only channels we can actually name get filtered."""
+    discard every packet; only channels we can actually name get filtered."""
     allowed = getattr(cfg, "allowed_channels", None) or set()
     hidden = getattr(cfg, "hidden_channels", None) or set()
     if not allowed and not hidden:
@@ -207,7 +207,7 @@ def mt_hops(packet: dict):
     if hl is None:
         hl = packet.get("hop_limit")
     # proto3 omits a field that equals 0, so an ABSENT hop_limit means 0 (the
-    # packet used up all its hops), not "unknown" — otherwise every fully
+    # packet used up all its hops), not "unknown"; otherwise every fully
     # relayed packet is dropped to null. hop_start is the originator's max hops
     # and is only meaningful when > 0; with it, hops = hop_start - hop_limit
     # (0 = heard directly). Without a real hop_start we genuinely can't tell.
@@ -494,7 +494,7 @@ MC_DIRECT_PATH_LEN = 255   # MeshCore path_len sentinel: heard directly = 0 hops
 
 
 def _mc_first(p: dict, *keys):
-    """First non-None value among keys — the RX-log join surfaces SNR/RSSI in
+    """First non-None value among keys. The RX-log join surfaces SNR/RSSI in
     upper-case, but be tolerant of either casing across library versions."""
     for k in keys:
         v = p.get(k)
@@ -644,7 +644,7 @@ async def mc_main() -> None:
             # messages (GRP_TXT frames) get decrypted and delivered as
             # CHANNEL_MSG_RECV events, and the RX-log join adds SNR/RSSI/path.
             # NOTE: the API is a METHOD (set_decrypt_channel_logs), not a
-            # `decrypt_channels` attribute — setting the attribute is a silent
+            # `decrypt_channels` attribute; setting the attribute is a silent
             # no-op. It also needs each channel's secret registered, so fetch
             # every channel first. All best-effort so older libs degrade cleanly.
             try:
@@ -661,7 +661,7 @@ async def mc_main() -> None:
                             names.append(f"{idx}:{cn}")
                     except Exception:
                         break
-                # names lets us confirm the "public" channel is registered — a
+                # names lets us confirm the "public" channel is registered; a
                 # channel must be registered here for its group texts to decrypt
                 log(f"[ok] meshcore channels registered: {names or maxch}")
             except Exception as exc:
@@ -932,7 +932,7 @@ def main() -> None:
         log(f"[info] filters: allowed_channels={sorted(cfg.allowed_channels) or 'all'}"
             f" hidden_channels={sorted(cfg.hidden_channels) or 'none'} min_snr={cfg.min_snr}")
     if cfg.rx_only:
-        log("[info] RX_ONLY set — noted; this ingestor never transmits to the mesh anyway")
+        log("[info] RX_ONLY set, noted; this ingestor never transmits to the mesh anyway")
 
     threading.Thread(target=flush_loop, daemon=True).start()
     log(f"[ok] Visalia Mesh ingestor v{__version__}: protocol={cfg.protocol}"
