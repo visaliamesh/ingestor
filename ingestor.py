@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.0"     # bump on each release; logged at startup
+__version__ = "1.3.1"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -339,6 +339,19 @@ def mt_self_report(iface) -> None:
         dbg(f"self-report failed: {exc}")
 
 
+def mt_is_stub(user: dict) -> bool:
+    """True when the radio's node-db entry is just the auto-placeholder for a
+    node it has only overheard (no real NodeInfo): the default name
+    'Meshtastic <last4>' plus no hardware model. Seeding that name would clobber
+    a real name another ingestor captured (node fields are last-write-wins), so
+    for these we seed the node id only and let the real NodeInfo fill the name."""
+    nid = (user.get("id") or "").lstrip("!")
+    suffix = nid[-4:].lower()
+    long_name = (user.get("longName") or "").strip().lower()
+    hw = str(user.get("hwModel", "")).upper()
+    return bool(suffix) and long_name == f"meshtastic {suffix}" and hw in ("", "UNSET", "0")
+
+
 def mt_seed_nodedb(interface) -> None:
     """Send the radio's node database once at startup for instant map coverage."""
     count = 0
@@ -348,11 +361,13 @@ def mt_seed_nodedb(interface) -> None:
             continue
         ts = node.get("lastHeard") or int(time.time())
         user = node.get("user", {})
+        stub = mt_is_stub(user)   # placeholder-only entry: don't seed a fake name
         put({"type": "nodeinfo", "num": num, "ts": ts,
-             "node_id": user.get("id"), "long_name": user.get("longName"),
-             "short_name": user.get("shortName"),
-             "hw_model": str(user.get("hwModel", "")) or None,
-             "role": str(user.get("role", "")) or None,
+             "node_id": user.get("id"),
+             "long_name": None if stub else user.get("longName"),
+             "short_name": None if stub else user.get("shortName"),
+             "hw_model": None if stub else (str(user.get("hwModel", "")) or None),
+             "role": None if stub else (str(user.get("role", "")) or None),
              "snr": node.get("snr")})
         pos = node.get("position", {})
         if real_position(pos.get("latitude"), pos.get("longitude")):
