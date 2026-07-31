@@ -50,7 +50,7 @@ Set these in `.env` (or the environment):
   name (`LongFast`, `MediumFast`, …)
 - `HIDDEN_CHANNELS`: channel names to drop when forwarding (blacklist)
 - `MIN_SNR`: drop packets weaker than this SNR floor in dB (blank = keep all)
-- `RX_ONLY`: accepted for potato compatibility but a no-op — this ingestor is
+- `RX_ONLY`: accepted for potato compatibility but a no-op; this ingestor is
   receive-only and never transmits to the mesh
 
 ## Coming from potato-mesh
