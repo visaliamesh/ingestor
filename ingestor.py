@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.2"     # bump on each release; logged at startup
+__version__ = "1.3.3"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -323,6 +323,22 @@ def mt_radio_info(iface):
             freq = round(ov, 4)
     except Exception as exc:
         dbg(f"radio info unavailable: {exc}")
+    # Fallback: some builds (notably PORTDUINO) don't expose localConfig.lora, so
+    # the preset reads back None. If the PRIMARY channel is named after a known
+    # preset (an unnamed default primary shows as its preset name, e.g.
+    # "MediumFast"), trust that. Gated to real preset names so a custom channel
+    # name like "Visalia" or "Public" is never mistaken for a modem preset.
+    if preset is None:
+        try:
+            names = set(MT_PRESET_NAMES.values())
+            for ch in getattr(iface.localNode, "channels", None) or []:
+                if int(getattr(ch, "role", 0)) == 1:   # 1 = PRIMARY
+                    nm = getattr(getattr(ch, "settings", None), "name", "") or ""
+                    if nm in names:
+                        preset = nm
+                    break
+        except Exception as exc:
+            dbg(f"preset channel-name fallback failed: {exc}")
     return preset, freq
 
 
