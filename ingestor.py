@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.3"     # bump on each release; logged at startup
+__version__ = "1.3.4"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -389,8 +389,14 @@ def mt_is_stub(user: dict) -> bool:
     return bool(suffix) and long_name == f"meshtastic {suffix}" and hw in ("", "UNSET", "0")
 
 
-def mt_seed_nodedb(interface) -> None:
-    """Send the radio's node database once at startup for instant map coverage."""
+def mt_seed_nodedb(interface, names_only: bool = False) -> None:
+    """Send the radio's node database for map coverage. Run at startup, then
+    periodically re-run with names_only=True: the radio keeps LEARNING names,
+    roles and hardware for nodes over time (from NodeInfo it decodes), so a
+    long-running ingestor that only seeded once at connect would never forward
+    those later-learned identities — leaving nodes stuck as bare `!hexid` on the
+    site even though the radio now knows them. The re-run forwards the current
+    phonebook; positions/telemetry are skipped on re-runs (they arrive live)."""
     count = 0
     for node in (interface.nodes or {}).values():
         num = node.get("num")
@@ -406,19 +412,21 @@ def mt_seed_nodedb(interface) -> None:
              "hw_model": None if stub else (str(user.get("hwModel", "")) or None),
              "role": None if stub else (str(user.get("role", "")) or None),
              "snr": node.get("snr")})
-        pos = node.get("position", {})
-        if real_position(pos.get("latitude"), pos.get("longitude")):
-            put({"type": "position", "num": num, "ts": ts,
-                 "lat": pos["latitude"], "lon": pos["longitude"],
-                 "alt": pos.get("altitude")})
-        dev = node.get("deviceMetrics", {})
-        if dev:
-            put({"type": "telemetry", "num": num, "ts": ts,
-                 "battery": dev.get("batteryLevel"), "voltage": dev.get("voltage"),
-                 "ch_util": dev.get("channelUtilization"),
-                 "air_util": dev.get("airUtilTx")})
+        if not names_only:
+            pos = node.get("position", {})
+            if real_position(pos.get("latitude"), pos.get("longitude")):
+                put({"type": "position", "num": num, "ts": ts,
+                     "lat": pos["latitude"], "lon": pos["longitude"],
+                     "alt": pos.get("altitude")})
+            dev = node.get("deviceMetrics", {})
+            if dev:
+                put({"type": "telemetry", "num": num, "ts": ts,
+                     "battery": dev.get("batteryLevel"), "voltage": dev.get("voltage"),
+                     "ch_util": dev.get("channelUtilization"),
+                     "air_util": dev.get("airUtilTx")})
         count += 1
-    log(f"[ok] seeded {count} nodes from radio node db")
+    log(f"[ok] {'re-seeded' if names_only else 'seeded'} {count} node"
+        f"{' names' if names_only else 's'} from radio node db")
 
 
 def mt_connect(conn: str | None):
@@ -487,10 +495,15 @@ def run_meshtastic() -> None:
             mt_seed_nodedb(iface)
             mt_self_report(iface)          # report our own health right away
             last_self = time.time()
+            last_seed = time.time()
             while True:
-                if time.time() - last_self > 300:   # refresh listener health every 5 min
+                now_t = time.time()
+                if now_t - last_self > 300:   # refresh listener health every 5 min
                     mt_self_report(iface)
-                    last_self = time.time()
+                    last_self = now_t
+                if now_t - last_seed > 3600:  # re-forward the radio's phonebook every
+                    mt_seed_nodedb(iface, names_only=True)   # hour: fill in names/
+                    last_seed = now_t                        # roles the radio has since learned
                 time.sleep(30)             # pubsub callbacks do the packet work
         except KeyboardInterrupt:
             return
