@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.4"     # bump on each release; logged at startup
+__version__ = "1.3.5"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -272,7 +272,7 @@ def mt_handle_packet(packet: dict) -> None:
         put({**base, "type": "nodeinfo", "node_id": user.get("id"),
              "long_name": user.get("longName"), "short_name": user.get("shortName"),
              "hw_model": str(user.get("hwModel", "")) or None,
-             "role": str(user.get("role", "")) or None})
+             "role": mt_role(user)})
 
     elif portnum == "TELEMETRY_APP":
         tel = decoded.get("telemetry", {})
@@ -363,7 +363,7 @@ def mt_self_report(iface) -> None:
              "node_id": user.get("id"), "long_name": user.get("longName"),
              "short_name": user.get("shortName"),
              "hw_model": str(user.get("hwModel", "")) or None,
-             "role": str(user.get("role", "")) or None,
+             "role": mt_role(user),
              "firmware": str(fw) if fw else None,
              "uptime_seconds": dev.get("uptimeSeconds"),
              "modem_preset": preset, "lora_freq": lora_freq})
@@ -389,6 +389,15 @@ def mt_is_stub(user: dict) -> bool:
     return bool(suffix) and long_name == f"meshtastic {suffix}" and hw in ("", "UNSET", "0")
 
 
+def mt_role(user: dict) -> str:
+    """A decoded User with NO role means CLIENT. proto3 omits default enum values,
+    and CLIENT is 0, so a node that switches TO client broadcasts NodeInfo with the
+    role field dropped entirely. Reading that as 'unknown/unchanged' (the old
+    behavior) left such nodes stuck on their previous role on the map, and left the
+    many plain CLIENT nodes with no role at all. Treat absent/empty as CLIENT."""
+    return str(user.get("role", "")) or "CLIENT"
+
+
 def mt_seed_nodedb(interface, names_only: bool = False) -> None:
     """Send the radio's node database for map coverage. Run at startup, then
     periodically re-run with names_only=True: the radio keeps LEARNING names,
@@ -410,7 +419,7 @@ def mt_seed_nodedb(interface, names_only: bool = False) -> None:
              "long_name": None if stub else user.get("longName"),
              "short_name": None if stub else user.get("shortName"),
              "hw_model": None if stub else (str(user.get("hwModel", "")) or None),
-             "role": None if stub else (str(user.get("role", "")) or None),
+             "role": None if stub else mt_role(user),
              "snr": node.get("snr")})
         if not names_only:
             pos = node.get("position", {})
