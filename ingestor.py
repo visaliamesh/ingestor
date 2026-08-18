@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.5"     # bump on each release; logged at startup
+__version__ = "1.3.6"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -789,7 +789,8 @@ async def mc_main() -> None:
                 sender_ts = int(p.get("timestamp") or time.time())
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(ident, sender_ts, f"c{chan_idx}", text),
-                     "channel": chan, "text": clean, "snr": snr, "rssi": rssi})
+                     "channel": chan, "text": clean, "snr": snr, "rssi": rssi,
+                     "hops": hops})
                 if num != self_num:   # keep our own message, but it's not a reception
                     put({"type": "reception", "num": num, "ts": int(time.time()),
                          "snr": snr, "rssi": rssi, "hops": hops, "portnum": "CHANNEL_MSG"})
@@ -807,7 +808,7 @@ async def mc_main() -> None:
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(prefix, sender_ts, "dm", text),
                      "channel": "dm", "to": self_num, "text": text,
-                     "snr": snr, "rssi": rssi})
+                     "snr": snr, "rssi": rssi, "hops": hops})
                 if num != self_num:
                     put({"type": "reception", "num": num, "ts": int(time.time()),
                          "snr": snr, "rssi": rssi, "hops": hops, "portnum": "CONTACT_MSG"})
