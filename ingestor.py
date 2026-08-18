@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.6"     # bump on each release; logged at startup
+__version__ = "1.3.7"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -750,6 +750,8 @@ async def mc_main() -> None:
                 ts = int(time.time())
                 snr, rssi = p.get("snr"), p.get("rssi")
                 hops = mc_hops(p.get("path_len"))
+                rpath = p.get("path")
+                rpath = rpath.lower() if isinstance(rpath, str) and rpath else None
                 is_self = (num == self_num)
                 if DEBUG:
                     dbg(f"meshcore rx-log advert: num={num} self={is_self} snr={snr}"
@@ -766,7 +768,8 @@ async def mc_main() -> None:
                 if real_position(lat, lon):
                     put({"type": "position", "num": num, "ts": ts, "lat": lat, "lon": lon})
                 put({"type": "reception", "num": num, "ts": ts, "snr": snr,
-                     "rssi": rssi, "hops": hops, "portnum": "ADVERTISEMENT"})
+                     "rssi": rssi, "hops": hops, "path": rpath,
+                     "portnum": "ADVERTISEMENT"})
 
             def on_channel_msg(event):
                 p = event.payload or {}
@@ -790,10 +793,11 @@ async def mc_main() -> None:
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(ident, sender_ts, f"c{chan_idx}", text),
                      "channel": chan, "text": clean, "snr": snr, "rssi": rssi,
-                     "hops": hops})
+                     "hops": hops, "path": path})
                 if num != self_num:   # keep our own message, but it's not a reception
                     put({"type": "reception", "num": num, "ts": int(time.time()),
-                         "snr": snr, "rssi": rssi, "hops": hops, "portnum": "CHANNEL_MSG"})
+                         "snr": snr, "rssi": rssi, "hops": hops, "path": path,
+                         "portnum": "CHANNEL_MSG"})
 
             def on_contact_msg(event):
                 p = event.payload or {}
@@ -808,10 +812,11 @@ async def mc_main() -> None:
                 put({"type": "message", "num": num, "ts": int(time.time()),
                      "msg_id": mc_msg_id(prefix, sender_ts, "dm", text),
                      "channel": "dm", "to": self_num, "text": text,
-                     "snr": snr, "rssi": rssi, "hops": hops})
+                     "snr": snr, "rssi": rssi, "hops": hops, "path": path})
                 if num != self_num:
                     put({"type": "reception", "num": num, "ts": int(time.time()),
-                         "snr": snr, "rssi": rssi, "hops": hops, "portnum": "CONTACT_MSG"})
+                         "snr": snr, "rssi": rssi, "hops": hops, "path": path,
+                         "portnum": "CONTACT_MSG"})
 
             mc.subscribe(EventType.ADVERTISEMENT, on_advert)
             mc.subscribe(EventType.CHANNEL_MSG_RECV, on_channel_msg)
