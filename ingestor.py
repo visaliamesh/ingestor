@@ -4,7 +4,7 @@
 Listens to a radio over serial, TCP, or BLE and forwards what it hears (RF only,
 no MQTT) to the Visalia Mesh dashboard ingest API.
 
-Configured with potato-mesh style environment variables; CLI flags override:
+Configured with environment variables; CLI flags override:
 
     INSTANCE_DOMAIN   dashboard base URL           (--server)
     API_TOKEN         ingestor bearer token        (--token)
@@ -64,7 +64,7 @@ def dbg(msg: str) -> None:
 
 
 def channel_allowed(name) -> bool:
-    """Potato-compatible channel gate. ALLOWED_CHANNELS is a name whitelist,
+    """Channel gate. ALLOWED_CHANNELS is a name whitelist,
     HIDDEN_CHANNELS a name blacklist, both case-insensitive. A None/unknown
     channel passes (fail-open) so a name-resolution miss can never silently
     discard every packet; only channels we can actually name get filtered."""
@@ -84,7 +84,7 @@ def channel_allowed(name) -> bool:
 
 def put(ev: dict) -> None:
     ev.setdefault("network", cfg.protocol)
-    # potato-compatible MIN_SNR: drop packets weaker than the floor. Events with
+    # MIN_SNR: drop packets weaker than the floor. Events with
     # no SNR (roster nodeinfo, self telemetry) carry None and always pass.
     mn = getattr(cfg, "min_snr", None)
     snr = ev.get("snr")
@@ -219,7 +219,7 @@ def mt_handle_packet(packet: dict) -> None:
     num = packet.get("from")
     if num is None:
         return
-    # potato-compatible ALLOWED/HIDDEN_CHANNELS: discard the WHOLE packet when
+    # ALLOWED/HIDDEN_CHANNELS: discard the WHOLE packet when
     # it arrived on a channel we're not accepting (by real name; falls open if
     # the name is unknown). chan_name is also used to label the message below.
     chan_idx = packet.get("channel", 0)
@@ -525,7 +525,7 @@ def run_meshtastic() -> None:
 # MeshCore (official `meshcore` python package, asyncio events)
 # ====================================================================
 
-# MeshCore adv types -> role names (matches the PotatoMesh contract)
+# MeshCore adv types -> role names
 MC_ROLES = {1: "COMPANION", 2: "REPEATER", 3: "ROOM_SERVER", 4: "SENSOR"}
 
 MC_DIRECT_PATH_LEN = 255   # MeshCore path_len sentinel: heard directly = 0 hops
@@ -585,10 +585,11 @@ def mc_pseudo_num(name: str) -> int:
 
 
 def mc_msg_id(sender_identity: str, sender_ts: int, discriminator: str, text: str) -> int:
-    """PotatoMesh v1 message fingerprint: sha256, first 7 bytes, masked to 53 bits.
+    """Stable message fingerprint: sha256, first 7 bytes, masked to 53 bits.
 
-    Using the same scheme means a message heard by both a potato ingestor and
-    this one dedupes to a single row after migration.
+    A content hash over sender, timestamp, channel, and text, so the same
+    message heard by more than one ingestor collapses to a single row on the
+    dashboard instead of showing up twice.
     """
     raw = f"v1:{sender_identity}:{sender_ts}:{discriminator}:{text}"
     digest = hashlib.sha256(raw.encode()).digest()
@@ -787,7 +788,7 @@ async def mc_main() -> None:
                 # label by real channel name ("Public"); fingerprint stays keyed
                 # on the index so it's stable regardless of naming
                 chan = channel_names.get(chan_idx) or str(chan_idx)
-                if not channel_allowed(chan):   # potato ALLOWED/HIDDEN_CHANNELS
+                if not channel_allowed(chan):   # ALLOWED/HIDDEN_CHANNELS
                     return
                 sender_ts = int(p.get("timestamp") or time.time())
                 put({"type": "message", "num": num, "ts": int(time.time()),
@@ -889,8 +890,8 @@ def parse_connection(conn: str | None, default_tcp_port: int) -> tuple[str, str]
     if not conn:
         return "serial", ""
     c = conn.strip()
-    # potato-mesh configs often hand the radio over as a URL like
-    # http://host:port. Strip the scheme (and any trailing /path) so we're left
+    # some configs hand the radio over as a URL like http://host:port. Strip
+    # the scheme (and any trailing /path) so we're left
     # with host[:port] for the TCP interface, otherwise it looks like a serial
     # device path and fails with "No such file or directory".
     m = re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://(.+)$", c)
@@ -915,8 +916,8 @@ def main() -> None:
                         help="ingestor bearer token (env API_TOKEN)")
     parser.add_argument("--connection", default=os.environ.get("CONNECTION"),
                         help="serial port, host[:port], or BLE MAC (env CONNECTION)")
-    # potato uses PROTOCOL; older builds of this script used MESH_PROTOCOL.
-    # Accept either so an existing potato config keeps working.
+    # current configs use PROTOCOL; older builds of this script used
+    # MESH_PROTOCOL. Accept either so an existing config keeps working.
     parser.add_argument("--protocol",
                         default=(os.environ.get("PROTOCOL")
                                  or os.environ.get("MESH_PROTOCOL") or "meshtastic"),
@@ -938,12 +939,12 @@ def main() -> None:
     if not cfg.server or not cfg.token:
         parser.error("--server/INSTANCE_DOMAIN and --token/API_TOKEN are required")
 
-    # potato allows a bare host in INSTANCE_DOMAIN and adds the scheme itself,
-    # so accept "map.visaliamesh.com" as well as a full URL.
+    # accept a bare host in INSTANCE_DOMAIN and add the scheme ourselves, so
+    # "map.visaliamesh.com" works as well as a full URL.
     if not re.match(r"^https?://", cfg.server):
         cfg.server = "https://" + cfg.server
 
-    # INGESTOR_NODE_ID (potato) overrides the host node number, for cases where
+    # INGESTOR_NODE_ID overrides the host node number, for cases where
     # the radio can't report its own. Auto-detect takes over once connected.
     global self_num
     node_id_env = os.environ.get("INGESTOR_NODE_ID", "").strip()
@@ -954,7 +955,7 @@ def main() -> None:
         except ValueError:
             log(f"[warn] INGESTOR_NODE_ID={node_id_env!r} is not a valid node id, ignoring")
 
-    # potato-compatible packet filters (ingestor-side, per-listener):
+    # packet filters (ingestor-side, per-listener):
     #   ALLOWED_CHANNELS - whitelist of channel NAMES; packets on any other
     #                      channel are discarded before sending (empty = accept all)
     #   HIDDEN_CHANNELS  - channel NAMES to drop when forwarding
