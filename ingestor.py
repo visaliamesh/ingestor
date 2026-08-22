@@ -38,7 +38,7 @@ import time
 
 import requests
 
-__version__ = "1.3.7"     # bump on each release; logged at startup
+__version__ = "1.3.8"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -633,6 +633,24 @@ async def mc_main() -> None:
             contacts_by_name[name.strip().lower()] = {**c, "num": num}
         contacts_by_prefix[key[:12].lower()] = {**c, "num": num}
 
+    async def seed_contacts(mc, tag: str) -> int:
+        """Pull the radio's whole contact roster and upsert every contact as a
+        full node record (name + role + position). Run at connect AND on a timer
+        so repeaters the radio learns LATER get their name/role into the dashboard,
+        instead of lingering as the bare !hex entry a plain advert leaves behind
+        (that is what left relay hops showing as 'unknown repeater')."""
+        try:
+            res = await mc.commands.get_contacts()
+            contacts = getattr(res, "payload", {}) or {}
+            for key, c in contacts.items():
+                if isinstance(c, dict):
+                    upsert_contact(str(key), c)
+            log(f"[ok] {tag} {len(contacts)} meshcore contacts")
+            return len(contacts)
+        except Exception as exc:
+            dbg(f"meshcore contact seed failed: {exc}")
+            return 0
+
     def sender_from_channel_text(text: str) -> tuple[int, str, str]:
         """MeshCore channel messages carry 'SenderName: text'. Returns
         (num, sender_identity_for_fingerprint, clean_text)."""
@@ -672,12 +690,7 @@ async def mc_main() -> None:
                 mc.auto_update_contacts = True
             except Exception:
                 pass
-            res = await mc.commands.get_contacts()
-            contacts = getattr(res, "payload", {}) or {}
-            for key, c in contacts.items():
-                if isinstance(c, dict):
-                    upsert_contact(str(key), c)
-            log(f"[ok] seeded {len(contacts)} meshcore contacts")
+            await seed_contacts(mc, "seeded")
 
             # Turn on the library's channel-log decryption so encrypted group
             # messages (GRP_TXT frames) get decrypted and delivered as
@@ -859,6 +872,10 @@ async def mc_main() -> None:
                                  "ts": int(time.time()), "battery": level})
                     except Exception as exc:
                         dbg(f"battery poll failed: {exc}")
+                # re-seed the contact roster every ~15 min so repeaters the radio
+                # learns while we're running get their name/role, not just a bare !hex
+                if tick > 0 and tick % 15 == 0:
+                    await seed_contacts(mc, "re-seeded")
                 # one-line summary of what we actually HEARD this window: distinct
                 # peers, channel/DM messages, and self-echo count. All zeros but a
                 # high self_adv count = only hearing our own advert reflected back.
