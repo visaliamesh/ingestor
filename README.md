@@ -25,12 +25,14 @@ is how you put it on the map.
 
 - [What it captures](#what-it-captures)
 - [Quick start with Docker](#quick-start-with-docker)
+- [A full docker-compose example](#a-full-docker-compose-example)
 - [Running it as a plain script](#running-it-as-a-plain-script)
 - [Connecting to your radio](#connecting-to-your-radio)
 - [Configuration](#configuration)
 - [Packet filters](#packet-filters)
 - [What it sends: the ingest API](#what-it-sends-the-ingest-api)
 - [Reading the logs](#reading-the-logs)
+- [Keeping and watching logs](#keeping-and-watching-logs)
 - [Auto-updating](#auto-updating)
 - [Building the image yourself](#building-the-image-yourself)
 - [How it works](#how-it-works)
@@ -73,6 +75,39 @@ You need an `API_TOKEN`. Ask a Visalia Mesh admin for one.
 For a USB radio, open `docker-compose.yml`, find the `devices:` block, uncomment
 it, and set your port. Run `ls /dev/ttyUSB* /dev/ttyACM*` to find the port name.
 Radios reached over TCP or BLE don't need that block, just set `CONNECTION`.
+
+## A full docker-compose example
+
+A complete, commented file for a Meshtastic radio reached over TCP. Change
+`CONNECTION`, `PROTOCOL`, and the filters to match your node.
+
+```yaml
+services:
+  visalia-ingestor:                                    # name it whatever you like
+    image: ghcr.io/visaliamesh/ingestor:latest
+    container_name: visalia-ingestor
+    restart: unless-stopped
+    network_mode: bridge
+    environment:
+      INSTANCE_DOMAIN: "https://map.visaliamesh.com"   # dashboard to send to (bare host works too)
+      API_TOKEN: "ask-an-admin-for-this"               # your ingestor token
+      CONNECTION: "10.0.0.101:4403"                    # radio: host[:port] (TCP), /dev/ttyUSB0 (serial), or AA:BB:CC:DD:EE:FF (BLE)
+      PROTOCOL: "meshtastic"                           # meshtastic (default) or meshcore
+      ALLOWED_CHANNELS: "MediumFast"                   # only forward these channel NAMES (blank = all)
+      DEBUG: "0"                                        # 1 = verbose; the failure hints still show at 0
+    logging:                                           # cap the on-disk log (optional, recommended)
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # For a USB/serial radio instead of TCP, drop the host:port from CONNECTION
+    # (or leave it blank to auto-detect) and pass the device through:
+    # devices:
+    #   - "/dev/ttyUSB0:/dev/ttyUSB0"
+```
+
+Then `docker compose up -d` and `docker compose logs -f`.
 
 ## Running it as a plain script
 
@@ -236,33 +271,67 @@ dashboard, and it never sends anything to the radio.
 
 ## Reading the logs
 
-`docker compose logs -f`, or `docker logs -f visalia-ingestor`. What to look for:
+`docker compose logs -f`, or `docker logs -f visalia-ingestor`. The lines are
+written to say what happened and, when something fails, whether the problem is on
+the dashboard/network side or in your own config.
 
-- `[ok] ...connected, this node: <num>` means the radio is talking to it. Until
-  you see this line, it hasn't reached the radio yet.
-- `[info] ingest <url> | token ...abcd | node ...` prints at startup so you can
-  eyeball the URL and token. The `...abcd` is the last four characters of your
-  token and matches what the dashboard logs, so you can line the two up if you're
-  unsure the token is right.
-- `[ok] sent N events (M accepted)` is a normal upload.
-- `[status] node=... queued=... sent=... accepted=... failed=... dropped=...`
-  prints every five minutes, even when the mesh is quiet, so you can confirm it's
-  alive. If `queued` and `failed` are both climbing, it can't reach the
-  dashboard.
-- `[info] waiting for this node's id before sending` shows for a second or two
-  right after connecting, while it learns its own node number. If it stays stuck
-  there, the radio isn't reporting an id; set `INGESTOR_NODE_ID`.
+Healthy lines:
 
-When an upload fails, the warning carries a hint at the cause:
+- `[ok] ...connected, this node: <num>`: the radio is talking to it. Until you
+  see this, it hasn't reached the radio.
+- `[info] ingest <url> | token ...abcd | node ...`: prints at startup so you can
+  eyeball the URL and token. The `...abcd` is the last four of your token and
+  matches what the dashboard logs.
+- `[ok] sent 100 events (100 accepted) in 0.4s`: a normal upload. The **duration**
+  is a live read on dashboard health; a line ending `<-- SLOW: dashboard is near
+  the timeout` means the server is struggling, not you.
+- `[ok] sent 100 events (62 accepted, 38 dupes ignored) in 0.5s`: `dupes` just
+  means another listener already reported those packets. Normal and healthy.
+- `[status] node=... queued=... pending=... sent=... accepted=... failed=...
+  dropped=... consec_fail=... session_age=...s`: a heartbeat every five minutes,
+  even when the mesh is quiet. `consec_fail=0` means all is well.
+- `[info] waiting for this node's id before sending`: shows for a second or two
+  after connecting while it learns its own node number. If it sticks there, the
+  radio isn't reporting an id; set `INGESTOR_NODE_ID`.
 
-| Log hint | Usually means |
+When an upload fails, it **retries on its own with backoff**, and the warning says
+what happened and whose side it's on:
+
+| Failure hint | What it means |
 | --- | --- |
-| `check API_TOKEN` (401 / 403) | The token is wrong or not registered on the server. |
-| `check INSTANCE_DOMAIN` (404 / 405) | The URL is wrong. It should point at the server root, like `https://map.visaliamesh.com`, not a page underneath it. |
-| `dashboard unreachable` | DNS, your network, or the server itself is down. |
+| `no reply within the timeout -> DASHBOARD slow/overloaded` | The server didn't answer in time (often busy, or a redeploy). Server side; it backs off and retries. |
+| `connection dropped mid-request -> DASHBOARD restarted or a Cloudflare hiccup` | Usually a dashboard redeploy. Rides out on its own. |
+| `HTTP 502/503/504 ... -> DASHBOARD side` | Gateway/origin error; server side. |
+| `auth rejected -> YOUR config: check API_TOKEN` | Your token is wrong or not registered. |
+| `wrong path -> YOUR config: check INSTANCE_DOMAIN` | Your URL is wrong; point it at the server root, not a page under it. |
+| `DNS can't resolve` / `connection refused` | Your network, or a typo in `INSTANCE_DOMAIN`. |
 
-Set `DEBUG=1` for per-packet detail and the server's full response body on any
-failure.
+It recovers by itself. After a few failures in a row it rebuilds its connection
+(`[warn] rebuilt the HTTP session ...`, the thing a container restart used to fix)
+and prints `[ok] dashboard reachable again after N failure(s)` once it's back, so
+you should not need to restart it manually.
+
+Set `DEBUG=1` for per-packet detail and the server's full response body on a
+failure. The failure hints above show at `DEBUG=0` too.
+
+## Keeping and watching logs
+
+Docker keeps each container's log on disk, but by default that file has **no size
+limit and grows forever**. The `logging:` block in the compose example caps it:
+`max-size: 10m` rotates the log at 10 MB and `max-file: 5` keeps five files
+(~50 MB total), deleting the rest. It has no effect on ingestion; it just stops
+the log filling the disk on a box that runs for months. Optional but recommended.
+(If your Docker host already sets a global default in `/etc/docker/daemon.json`,
+the per-container block is redundant.)
+
+Watch or review:
+
+- Live: `docker logs -f visalia-ingestor`
+- Just the problems: `docker logs visalia-ingestor 2>&1 | grep -E "warn|failed|rebuilt|reachable"`
+
+You don't have to watch logs to know a listener is up, either: the dashboard's
+Stats page shows every ingestor's online/offline state, last report time, and
+version.
 
 ## Auto-updating
 
@@ -301,15 +370,22 @@ One process, a couple of moving parts:
   unreachable for a while, new events pile up here and the oldest are dropped
   once it fills, so a long outage never eats all your memory.
 - A **sender** thread that wakes every five seconds, pulls up to 100 events off
-  the queue, and POSTs them. On failure it keeps the batch and retries, so a
-  brief network blip doesn't lose data.
+  the queue, and POSTs them. It is built to ride out a flaky or briefly-down
+  dashboard on its own: it retries gateway errors and dropped connections on a
+  fresh socket, keeps the batch and backs off exponentially (up to a minute) on
+  repeated failures instead of hammering, and **rebuilds its whole HTTP
+  connection after a few failures in a row** so a wedged connection heals itself
+  without a container restart. Retries are safe because the dashboard de-dupes
+  every event, so a re-sent batch is a no-op.
 
 It waits until the radio has reported its own node number before it sends
 anything, so every packet is credited to the right listener from the very first
 upload. Alongside the mesh traffic, it reports its own radio's health at startup
 and every five minutes. On Meshtastic it also re-reads the radio's node database
-once an hour, so names and roles the radio learns later fill in without a
-restart.
+once an hour, but only forwards the nodes whose name, role, or hardware actually
+**changed** since last time, so the periodic refresh is a trickle rather than a
+burst. On MeshCore it refreshes the contact roster the same way every 15 minutes,
+so repeaters the radio learns later pick up their names and roles.
 
 None of this ever writes to the radio. Grep the source if you like; there are no
 send, reboot, or admin calls anywhere in it.
