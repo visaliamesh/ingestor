@@ -37,13 +37,18 @@ import threading
 import time
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-__version__ = "1.3.8"     # bump on each release; logged at startup
+__version__ = "1.3.9"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
 MAX_QUEUE = 5000
 STATUS_SECONDS = 300      # print a health line at least this often, even when idle
+SEND_TIMEOUT = 30         # per-POST timeout (s); the dashboard can be slow under load
+MAX_BACKOFF = 60          # cap the exponential retry backoff at this many seconds
+SESSION_REBUILD_AFTER = 3 # consecutive failures before we throw away the HTTP session
 
 events: "queue.Queue[dict]" = queue.Queue(maxsize=MAX_QUEUE)
 cfg = None
@@ -53,6 +58,11 @@ DEBUG = os.environ.get("DEBUG") == "1"
 # running totals for the periodic [status] line and for debugging
 STATS = {"sent": 0, "accepted": 0, "failed": 0, "dropped": 0}
 
+# last identity (id, name, short, hw, role) we forwarded per node, so the hourly
+# node-db re-seed only sends nodes that actually CHANGED instead of re-POSTing the
+# whole phonebook (hundreds of nodes) as one burst every hour
+_seeded_ids: dict = {}
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -61,6 +71,17 @@ def log(msg: str) -> None:
 def dbg(msg: str) -> None:
     if DEBUG:
         print(f"[debug] {msg}", flush=True)
+
+
+_warned_keys: set = set()
+
+
+def dbg_once(key: str, msg: str) -> None:
+    """Debug-log a recurring, harmless condition only the FIRST time, so it does
+    not repeat on every poll and bury the lines that matter."""
+    if key not in _warned_keys:
+        _warned_keys.add(key)
+        dbg(msg)
 
 
 def channel_allowed(name) -> bool:
@@ -102,27 +123,57 @@ def put(ev: dict) -> None:
 
 
 def send_hint(exc: Exception) -> str:
-    """Turn a failed POST into a one-line pointer at the likely misconfig."""
+    """Turn a failed POST into a one-line pointer at the likely cause, so the log
+    says WHAT went wrong and whether it's ours (dashboard/network) or yours."""
     resp = getattr(exc, "response", None)
-    if resp is None:
-        return "  (dashboard unreachable, check CONNECTION to the network / server URL)"
-    code = resp.status_code
-    if code in (401, 403):
-        return "  (auth rejected, check API_TOKEN)"
-    if code in (404, 405):
-        return "  (wrong path, check INSTANCE_DOMAIN, e.g. https://map.visaliamesh.com)"
-    if code >= 500:
-        return "  (dashboard server error, will retry)"
-    return ""
+    if resp is not None:
+        code = resp.status_code
+        if code in (401, 403):
+            return "  (auth rejected -> YOUR config: check API_TOKEN)"
+        if code in (404, 405):
+            return "  (wrong path -> YOUR config: check INSTANCE_DOMAIN, e.g. https://map.visaliamesh.com)"
+        if code in (502, 503, 504):
+            return f"  (HTTP {code} gateway/origin error -> DASHBOARD side is down, restarting, or overloaded; backing off)"
+        if code >= 500:
+            return f"  (HTTP {code} server error -> DASHBOARD side; backing off)"
+        return f"  (HTTP {code})"
+    # no HTTP response == the request never completed. Classify by the exception.
+    s = f"{type(exc).__name__}: {exc}".lower()
+    if "timed out" in s or "timeout" in s:
+        return "  (no reply within the timeout -> DASHBOARD slow/overloaded or a redeploy in progress; backing off)"
+    if "remotedisconnected" in s or "connection aborted" in s or "reset" in s or "broken pipe" in s:
+        return "  (connection dropped mid-request -> DASHBOARD restarted or a Cloudflare hiccup; retrying on a fresh connection)"
+    if "name or service not known" in s or "getaddrinfo" in s or "nodename nor servname" in s:
+        return "  (DNS can't resolve the host -> YOUR network/DNS, or a typo in INSTANCE_DOMAIN)"
+    if "refused" in s:
+        return "  (connection refused -> DASHBOARD down or wrong host/port in INSTANCE_DOMAIN)"
+    return "  (dashboard unreachable -> check YOUR network and INSTANCE_DOMAIN)"
+
+
+def make_session() -> requests.Session:
+    """A requests session that retries transient gateway/origin errors on a FRESH
+    connection. A dropped keep-alive or a 502 while the dashboard restarts should
+    not fail the whole batch by itself."""
+    s = requests.Session()
+    s.headers["Authorization"] = f"Bearer {cfg.token}"
+    retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5,
+                  status_forcelist=(502, 503, 504),
+                  allowed_methods=frozenset(["POST"]), raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=4, pool_maxsize=4)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
 
 
 def flush_loop() -> None:
     pending: list[dict] = []
-    session = requests.Session()
-    session.headers["Authorization"] = f"Bearer {cfg.token}"
+    session = make_session()
+    session_started = time.time()
     url = cfg.server.rstrip("/") + "/api/ingest"
     last_status = time.time()
     holding = False
+    consec_fail = 0
+    fail_since = 0.0
 
     while True:
         time.sleep(FLUSH_SECONDS)
@@ -149,31 +200,56 @@ def flush_loop() -> None:
                 break
 
         if pending:
+            t0 = time.time()
             try:
                 r = session.post(url, json={"events": pending, "ingestor_node": self_num,
                                             "ingestor_version": __version__},
-                                 timeout=15)
+                                 timeout=SEND_TIMEOUT)
                 r.raise_for_status()
+                dur = time.time() - t0
                 accepted = r.json().get("accepted")
                 STATS["sent"] += len(pending)
                 STATS["accepted"] += accepted or 0
-                log(f"[ok] sent {len(pending)} events ({accepted} accepted)")
+                if consec_fail:   # we were failing, now we're back
+                    log(f"[ok] dashboard reachable again after {consec_fail} failure(s)"
+                        f" / {int(time.time() - fail_since)}s down")
+                    consec_fail = 0
+                dupes = len(pending) - (accepted or 0)
+                log(f"[ok] sent {len(pending)} events ({accepted} accepted"
+                    + (f", {dupes} dupes ignored" if dupes > 0 else "")
+                    + f") in {dur:.1f}s"
+                    + ("  <-- SLOW: dashboard is near the timeout" if dur > SEND_TIMEOUT * 0.6 else ""))
                 pending = []
             except Exception as exc:
+                consec_fail += 1
                 STATS["failed"] += 1
-                print(f"[warn] send failed, will retry: {exc}{send_hint(exc)}",
+                if consec_fail == 1:
+                    fail_since = t0
+                backoff = min(FLUSH_SECONDS * (2 ** (consec_fail - 1)), MAX_BACKOFF)
+                print(f"[warn] send failed ({consec_fail} in a row, {events.qsize()} queued,"
+                      f" {len(pending)} in this batch), retry in {backoff}s: {exc}{send_hint(exc)}",
                       file=sys.stderr)
                 resp = getattr(exc, "response", None)
                 if DEBUG and resp is not None:
                     dbg(f"response {resp.status_code}: {resp.text[:300]}")
+                # a wedged connection pool is the classic "had to restart the
+                # container" case — throw the session away and rebuild so we
+                # self-heal instead of failing forever on a dead connection
+                if consec_fail % SESSION_REBUILD_AFTER == 0:
+                    session = make_session()
+                    session_started = time.time()
+                    log(f"[warn] rebuilt the HTTP session after {consec_fail}"
+                        f" consecutive failures (self-heal, no restart needed)")
                 pending = pending[-MAX_BATCH * 5:]  # cap retry backlog
+                time.sleep(backoff)                 # exponential backoff, don't hammer
 
         # a heartbeat so operators can tell it is alive and healthy even when the
         # radio is quiet; also the quickest read on queue depth and error counts
         if time.time() - last_status >= STATUS_SECONDS:
-            log(f"[status] node={self_num} queued={events.qsize()}"
+            log(f"[status] node={self_num} queued={events.qsize()} pending={len(pending)}"
                 f" sent={STATS['sent']} accepted={STATS['accepted']}"
-                f" failed={STATS['failed']} dropped={STATS['dropped']}")
+                f" failed={STATS['failed']} dropped={STATS['dropped']}"
+                f" consec_fail={consec_fail} session_age={int(time.time() - session_started)}s")
             last_status = time.time()
 
 
@@ -322,7 +398,9 @@ def mt_radio_info(iface):
         if ov > 0:
             freq = round(ov, 4)
     except Exception as exc:
-        dbg(f"radio info unavailable: {exc}")
+        dbg_once("radio_info", f"localConfig.lora unavailable ({exc}); this is HARMLESS"
+                 " on a TCP/PORTDUINO link — falling back to the primary channel name"
+                 " for the modem preset")
     # Fallback: some builds (notably PORTDUINO) don't expose localConfig.lora, so
     # the preset reads back None. If the PRIMARY channel is named after a known
     # preset (an unnamed default primary shows as its preset name, e.g.
@@ -406,21 +484,29 @@ def mt_seed_nodedb(interface, names_only: bool = False) -> None:
     those later-learned identities — leaving nodes stuck as bare `!hexid` on the
     site even though the radio now knows them. The re-run forwards the current
     phonebook; positions/telemetry are skipped on re-runs (they arrive live)."""
-    count = 0
+    count = sent = 0
     for node in (interface.nodes or {}).values():
         num = node.get("num")
         if num is None:
             continue
+        count += 1
         ts = node.get("lastHeard") or int(time.time())
         user = node.get("user", {})
         stub = mt_is_stub(user)   # placeholder-only entry: don't seed a fake name
+        identity = (user.get("id"),
+                    None if stub else user.get("longName"),
+                    None if stub else user.get("shortName"),
+                    None if stub else (str(user.get("hwModel", "")) or None),
+                    None if stub else mt_role(user))
+        # periodic re-seed: skip a node whose identity is unchanged since we last
+        # sent it. The initial full seed always sends (and populates the cache).
+        if names_only and _seeded_ids.get(num) == identity:
+            continue
+        _seeded_ids[num] = identity
         put({"type": "nodeinfo", "num": num, "ts": ts,
-             "node_id": user.get("id"),
-             "long_name": None if stub else user.get("longName"),
-             "short_name": None if stub else user.get("shortName"),
-             "hw_model": None if stub else (str(user.get("hwModel", "")) or None),
-             "role": None if stub else mt_role(user),
-             "snr": node.get("snr")})
+             "node_id": identity[0], "long_name": identity[1], "short_name": identity[2],
+             "hw_model": identity[3], "role": identity[4], "snr": node.get("snr")})
+        sent += 1
         if not names_only:
             pos = node.get("position", {})
             if real_position(pos.get("latitude"), pos.get("longitude")):
@@ -433,9 +519,10 @@ def mt_seed_nodedb(interface, names_only: bool = False) -> None:
                      "battery": dev.get("batteryLevel"), "voltage": dev.get("voltage"),
                      "ch_util": dev.get("channelUtilization"),
                      "air_util": dev.get("airUtilTx")})
-        count += 1
-    log(f"[ok] {'re-seeded' if names_only else 'seeded'} {count} node"
-        f"{' names' if names_only else 's'} from radio node db")
+    if names_only:
+        log(f"[ok] re-seeded {sent} changed of {count} node names from radio node db")
+    else:
+        log(f"[ok] seeded {count} nodes from radio node db")
 
 
 def mt_connect(conn: str | None):
