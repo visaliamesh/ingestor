@@ -28,6 +28,7 @@ Requires:  pip install meshtastic requests        (Meshtastic)
 
 import argparse
 import asyncio
+import collections
 import hashlib
 import os
 import queue
@@ -40,7 +41,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.3.9"     # bump on each release; logged at startup
+__version__ = "1.4.0"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -57,6 +58,12 @@ DEBUG = os.environ.get("DEBUG") == "1"
 
 # running totals for the periodic [status] line and for debugging
 STATS = {"sent": 0, "accepted": 0, "failed": 0, "dropped": 0}
+
+# health the ingestor periodically reports to the dashboard so the admin panel
+# can show it remotely (the operator's Docker logs aren't reachable from there)
+START_TIME = time.time()
+RECENT_LOG: "collections.deque" = collections.deque(maxlen=60)  # last warn/error lines
+LAST_ERROR = None                                               # {"text":..,"ts":..} or None
 
 # last identity (id, name, short, hw, role) we forwarded per node, so the hourly
 # node-db re-seed only sends nodes that actually CHANGED instead of re-POSTing the
@@ -82,6 +89,31 @@ def dbg_once(key: str, msg: str) -> None:
     if key not in _warned_keys:
         _warned_keys.add(key)
         dbg(msg)
+
+
+def warn(msg: str) -> None:
+    """An operational warning: print to stderr AND keep it in a small ring buffer
+    the ingestor reports to the dashboard, so an operator can see recent trouble
+    from the admin panel without shell access to the box."""
+    global LAST_ERROR
+    line = f"[warn] {msg}"
+    print(line, file=sys.stderr, flush=True)
+    ts = int(time.time())
+    RECENT_LOG.append([ts, line[:400]])
+    LAST_ERROR = {"text": msg[:400], "ts": ts}
+
+
+def status_payload(consec_fail: int) -> dict:
+    """Structured health + the recent-warning tail, sent to the dashboard on the
+    ingest heartbeat so the admin panel can show how a listener is doing."""
+    return {
+        "uptime_s": int(time.time() - START_TIME),
+        "sent": STATS["sent"], "accepted": STATS["accepted"],
+        "failed": STATS["failed"], "dropped": STATS["dropped"],
+        "queued": events.qsize(), "consec_fail": consec_fail,
+        "last_error": LAST_ERROR,
+        "recent_log": list(RECENT_LOG),
+    }
 
 
 def channel_allowed(name) -> bool:
@@ -118,8 +150,7 @@ def put(ev: dict) -> None:
         # the queue only fills when the dashboard has been unreachable for a
         # while, so rate-limit this or it floods the log
         if STATS["dropped"] % 100 == 1:
-            print(f"[warn] event queue full, dropping events"
-                  f" (total dropped {STATS['dropped']})", file=sys.stderr)
+            warn(f"event queue full, dropping events (total dropped {STATS['dropped']})")
 
 
 def send_hint(exc: Exception) -> str:
@@ -171,6 +202,7 @@ def flush_loop() -> None:
     session_started = time.time()
     url = cfg.server.rstrip("/") + "/api/ingest"
     last_status = time.time()
+    last_status_sent = 0.0            # when we last reported health to the dashboard
     holding = False
     consec_fail = 0
     fail_since = 0.0
@@ -199,12 +231,17 @@ def flush_loop() -> None:
             except queue.Empty:
                 break
 
-        if pending:
+        # report health to the dashboard on the same ~5 min cadence (rides on a
+        # batch when there is one, else a status-only POST keeps the heartbeat)
+        status_due = (time.time() - last_status_sent) >= STATUS_SECONDS
+        if pending or status_due:
             t0 = time.time()
+            body = {"events": pending, "ingestor_node": self_num,
+                    "ingestor_version": __version__}
+            if status_due:
+                body["status"] = status_payload(consec_fail)
             try:
-                r = session.post(url, json={"events": pending, "ingestor_node": self_num,
-                                            "ingestor_version": __version__},
-                                 timeout=SEND_TIMEOUT)
+                r = session.post(url, json=body, timeout=SEND_TIMEOUT)
                 r.raise_for_status()
                 dur = time.time() - t0
                 accepted = r.json().get("accepted")
@@ -214,11 +251,16 @@ def flush_loop() -> None:
                     log(f"[ok] dashboard reachable again after {consec_fail} failure(s)"
                         f" / {int(time.time() - fail_since)}s down")
                     consec_fail = 0
-                dupes = len(pending) - (accepted or 0)
-                log(f"[ok] sent {len(pending)} events ({accepted} accepted"
-                    + (f", {dupes} dupes ignored" if dupes > 0 else "")
-                    + f") in {dur:.1f}s"
-                    + ("  <-- SLOW: dashboard is near the timeout" if dur > SEND_TIMEOUT * 0.6 else ""))
+                if status_due:
+                    last_status_sent = time.time()
+                if pending:
+                    dupes = len(pending) - (accepted or 0)
+                    log(f"[ok] sent {len(pending)} events ({accepted} accepted"
+                        + (f", {dupes} dupes ignored" if dupes > 0 else "")
+                        + f") in {dur:.1f}s"
+                        + ("  <-- SLOW: dashboard is near the timeout" if dur > SEND_TIMEOUT * 0.6 else ""))
+                else:
+                    dbg(f"status heartbeat sent in {dur:.1f}s")
                 pending = []
             except Exception as exc:
                 consec_fail += 1
@@ -226,9 +268,8 @@ def flush_loop() -> None:
                 if consec_fail == 1:
                     fail_since = t0
                 backoff = min(FLUSH_SECONDS * (2 ** (consec_fail - 1)), MAX_BACKOFF)
-                print(f"[warn] send failed ({consec_fail} in a row, {events.qsize()} queued,"
-                      f" {len(pending)} in this batch), retry in {backoff}s: {exc}{send_hint(exc)}",
-                      file=sys.stderr)
+                warn(f"send failed ({consec_fail} in a row, {events.qsize()} queued,"
+                     f" {len(pending)} in this batch), retry in {backoff}s: {exc}{send_hint(exc)}")
                 resp = getattr(exc, "response", None)
                 if DEBUG and resp is not None:
                     dbg(f"response {resp.status_code}: {resp.text[:300]}")
@@ -238,8 +279,8 @@ def flush_loop() -> None:
                 if consec_fail % SESSION_REBUILD_AFTER == 0:
                     session = make_session()
                     session_started = time.time()
-                    log(f"[warn] rebuilt the HTTP session after {consec_fail}"
-                        f" consecutive failures (self-heal, no restart needed)")
+                    warn(f"rebuilt the HTTP session after {consec_fail}"
+                         " consecutive failures (self-heal, no restart needed)")
                 pending = pending[-MAX_BATCH * 5:]  # cap retry backlog
                 time.sleep(backoff)                 # exponential backoff, don't hammer
 
@@ -268,7 +309,7 @@ def mt_on_receive(packet, interface):  # noqa: ANN001 - meshtastic pubsub signat
     try:
         mt_handle_packet(packet)
     except Exception as exc:
-        print(f"[warn] failed to handle packet: {exc}", file=sys.stderr)
+        warn(f"failed to handle packet: {exc}")
 
 
 def mt_hops(packet: dict):
@@ -604,7 +645,7 @@ def run_meshtastic() -> None:
         except KeyboardInterrupt:
             return
         except Exception as exc:
-            print(f"[warn] connection lost ({exc}), reconnecting in 15 s", file=sys.stderr)
+            warn(f"radio connection lost ({exc}), reconnecting in 15 s")
             time.sleep(15)
 
 
@@ -977,8 +1018,7 @@ async def mc_main() -> None:
         except KeyboardInterrupt:
             return
         except Exception as exc:
-            print(f"[warn] meshcore connection lost ({exc}), reconnecting in 15 s",
-                  file=sys.stderr)
+            warn(f"meshcore radio connection lost ({exc}), reconnecting in 15 s")
             await asyncio.sleep(15)
 
 
