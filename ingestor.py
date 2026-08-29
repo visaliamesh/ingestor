@@ -41,7 +41,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.4.0"     # bump on each release; logged at startup
+__version__ = "1.4.1"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -50,6 +50,10 @@ STATUS_SECONDS = 300      # print a health line at least this often, even when i
 SEND_TIMEOUT = 30         # per-POST timeout (s); the dashboard can be slow under load
 MAX_BACKOFF = 60          # cap the exponential retry backoff at this many seconds
 SESSION_REBUILD_AFTER = 3 # consecutive failures before we throw away the HTTP session
+# radio watchdog: if the radio can't be (re)connected for this long, exit so the
+# container's restart policy starts a FRESH process — which re-resolves the host
+# and rebuilds the interface, exactly what a manual restart does. 0 disables it.
+RADIO_DOWN_EXIT_S = int(os.environ.get("RADIO_DOWN_EXIT_MIN", "5") or "5") * 60
 
 events: "queue.Queue[dict]" = queue.Queue(maxsize=MAX_QUEUE)
 cfg = None
@@ -62,7 +66,7 @@ STATS = {"sent": 0, "accepted": 0, "failed": 0, "dropped": 0}
 # health the ingestor periodically reports to the dashboard so the admin panel
 # can show it remotely (the operator's Docker logs aren't reachable from there)
 START_TIME = time.time()
-RECENT_LOG: "collections.deque" = collections.deque(maxlen=60)  # last warn/error lines
+RECENT_LOG: "collections.deque" = collections.deque(maxlen=200)  # last warn/error lines
 LAST_ERROR = None                                               # {"text":..,"ts":..} or None
 
 # last identity (id, name, short, hw, role) we forwarded per node, so the hourly
@@ -114,6 +118,21 @@ def status_payload(consec_fail: int) -> dict:
         "last_error": LAST_ERROR,
         "recent_log": list(RECENT_LOG),
     }
+
+
+def flush_and_exit(reason: str) -> None:
+    """Radio watchdog last resort. Log why, give the background sender a few
+    seconds to drain the queue and report a final status, then hard-exit so the
+    container's restart policy (restart: unless-stopped) starts a fresh process.
+    A clean process re-resolves the radio host and rebuilds the interface, which
+    is exactly what manually restarting the container does."""
+    warn(reason)
+    deadline = time.time() + 8
+    while not events.empty() and time.time() < deadline:
+        time.sleep(0.5)
+    log(f"[watchdog] restarting the container so the radio reconnects cleanly"
+        f" (queued left: {events.qsize()})")
+    os._exit(1)
 
 
 def channel_allowed(name) -> bool:
@@ -622,12 +641,14 @@ def run_meshtastic() -> None:
     from pubsub import pub
     pub.subscribe(mt_on_receive, "meshtastic.receive")
 
+    last_good = time.time()   # last time the radio was healthily connected
     while True:
         try:
             iface = mt_connect(cfg.connection)
             info = iface.getMyNodeInfo() or {}
             self_num = info.get("num")
             log(f"[ok] meshtastic connected, this node: {self_num}")
+            last_good = time.time()
             mt_load_channels(iface)        # resolve channel names for filtering
             mt_seed_nodedb(iface)
             mt_self_report(iface)          # report our own health right away
@@ -635,6 +656,7 @@ def run_meshtastic() -> None:
             last_seed = time.time()
             while True:
                 now_t = time.time()
+                last_good = now_t          # inner loop only runs while connected
                 if now_t - last_self > 300:   # refresh listener health every 5 min
                     mt_self_report(iface)
                     last_self = now_t
@@ -645,7 +667,12 @@ def run_meshtastic() -> None:
         except KeyboardInterrupt:
             return
         except Exception as exc:
-            warn(f"radio connection lost ({exc}), reconnecting in 15 s")
+            down_s = int(time.time() - last_good)
+            # watchdog: reconnect keeps failing (radio down / host unreachable) →
+            # restart the container instead of looping forever like before
+            if RADIO_DOWN_EXIT_S and down_s >= RADIO_DOWN_EXIT_S:
+                flush_and_exit(f"radio unreachable for {down_s}s (>{RADIO_DOWN_EXIT_S}s): {exc}")
+            warn(f"radio connection lost ({exc}); radio down {down_s}s, reconnecting in 15 s")
             time.sleep(15)
 
 
@@ -793,6 +820,7 @@ async def mc_main() -> None:
             return num, ident, text
         return mc_pseudo_num("unknown"), "", text
 
+    last_good = time.time()   # last time the radio was healthily connected
     while True:
         try:
             if kind == "tcp":
@@ -809,6 +837,7 @@ async def mc_main() -> None:
             self_key = info.get("public_key", "")
             self_num = mc_num(self_key)
             log(f"[ok] meshcore connected, this node: {self_num}")
+            last_good = time.time()
             if real_position(info.get("adv_lat"), info.get("adv_lon")):
                 put({"type": "position", "num": self_num, "ts": int(time.time()),
                      "lat": info["adv_lat"], "lon": info["adv_lon"]})
@@ -991,6 +1020,7 @@ async def mc_main() -> None:
             # shows up quickly; poll battery only every 10th tick (~10 min).
             tick = 0
             while True:
+                last_good = time.time()    # inner loop only runs while connected
                 if tick % 10 == 0:
                     try:
                         res = await mc.commands.get_bat()
@@ -1018,7 +1048,10 @@ async def mc_main() -> None:
         except KeyboardInterrupt:
             return
         except Exception as exc:
-            warn(f"meshcore radio connection lost ({exc}), reconnecting in 15 s")
+            down_s = int(time.time() - last_good)
+            if RADIO_DOWN_EXIT_S and down_s >= RADIO_DOWN_EXIT_S:
+                flush_and_exit(f"meshcore radio unreachable for {down_s}s (>{RADIO_DOWN_EXIT_S}s): {exc}")
+            warn(f"meshcore radio connection lost ({exc}); radio down {down_s}s, reconnecting in 15 s")
             await asyncio.sleep(15)
 
 

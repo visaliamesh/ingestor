@@ -86,7 +86,7 @@ services:
   visalia-ingestor:                                    # name it whatever you like
     image: ghcr.io/visaliamesh/ingestor:latest
     container_name: visalia-ingestor
-    restart: unless-stopped
+    restart: unless-stopped                            # REQUIRED: the radio watchdog restarts by exiting
     network_mode: bridge
     environment:
       INSTANCE_DOMAIN: "https://map.visaliamesh.com"   # dashboard to send to (bare host works too)
@@ -94,6 +94,7 @@ services:
       CONNECTION: "10.0.0.101:4403"                    # radio: host[:port] (TCP), /dev/ttyUSB0 (serial), or AA:BB:CC:DD:EE:FF (BLE)
       PROTOCOL: "meshtastic"                           # meshtastic (default) or meshcore
       ALLOWED_CHANNELS: "MediumFast"                   # only forward these channel NAMES (blank = all)
+      RADIO_DOWN_EXIT_MIN: "5"                          # watchdog: restart if the radio is unreachable this long (0 = off)
       DEBUG: "0"                                        # 1 = verbose; the failure hints still show at 0
     logging:                                           # cap the on-disk log (optional, recommended)
       driver: json-file
@@ -186,8 +187,26 @@ Only the first three are required.
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `INGESTOR_NODE_ID` | auto | Pin this listener's own node id when the radio can't report it. Use the radio's id, for example `!cc384cc7`, or a plain number. Auto-detection handles this on its own in almost every case. |
+| `RADIO_DOWN_EXIT_MIN` | `5` | Radio watchdog. If the radio can't be reconnected for this many minutes, the ingestor exits so the container restarts fresh (see below). Set `0` to turn it off. |
 | `RX_ONLY` | unset | A no-op. The ingestor only ever listens. It is read only so an older config that still sets this keeps working. |
 | `MESH_PROTOCOL` | unset | Older name for `PROTOCOL`. Still read if present. |
+
+### Radio watchdog
+
+The ingestor reconnects on its own whenever the radio drops, retrying every 15
+seconds. But if the radio itself is down or unreachable for a long stretch (host
+powered off, IP changed, the radio's TCP service wedged), reconnecting can never
+succeed, and older versions would loop on that forever until someone restarted
+the container by hand.
+
+Now, after `RADIO_DOWN_EXIT_MIN` minutes (default 5) of failed reconnects, the
+ingestor logs the reason and exits. Docker's `restart: unless-stopped` then
+starts a fresh process, which re-resolves the radio's host and rebuilds the
+connection from scratch: the same thing a manual restart does, done for you.
+
+This only works if the container has a restart policy. The compose example
+above sets `restart: unless-stopped`; keep it. To disable the watchdog, set
+`RADIO_DOWN_EXIT_MIN: "0"`.
 
 ## Packet filters
 
