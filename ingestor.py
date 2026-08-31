@@ -41,7 +41,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.4.1"     # bump on each release; logged at startup
+__version__ = "1.4.2"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 5
 MAX_BATCH = 100
@@ -429,11 +429,16 @@ def mt_handle_packet(packet: dict) -> None:
         rd = decoded.get("traceroute", {})
         # capture BOTH directions: forward (route/snrTowards) AND the return
         # path (routeBack/snrBack) the reply carries. protobuf SNR is dB * 4.
+        # request_id != 0 marks a traceroute REPLY (it references the original
+        # request's packet id); a request carries request_id 0. This lets the
+        # dashboard tell request from reply DEFINITIVELY (who traced whom) instead
+        # of guessing from whether route_back is populated.
         put({**base, "type": "traceroute", "to": packet.get("to"),
              "route": list(rd.get("route", [])),
              "route_back": list(rd.get("routeBack", [])),
              "snr_towards": [s / 4 for s in rd.get("snrTowards", [])],
-             "snr_back": [s / 4 for s in rd.get("snrBack", [])]})
+             "snr_back": [s / 4 for s in rd.get("snrBack", [])],
+             "request_id": decoded.get("requestId") or 0})
 
     elif portnum == "NEIGHBORINFO_APP":
         info = decoded.get("neighborinfo", {})
