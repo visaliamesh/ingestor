@@ -41,9 +41,11 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.4.2"     # bump on each release; logged at startup
+__version__ = "1.4.3"     # bump on each release; logged at startup
 
-FLUSH_SECONDS = 5
+FLUSH_SECONDS = 2         # upload cadence: smaller/more-frequent batches so the
+                          # dashboard's live SSE stream trickles instead of chunking
+                          # every 5 s (still batches bursts up to MAX_BATCH per POST)
 MAX_BATCH = 100
 MAX_QUEUE = 5000
 STATUS_SECONDS = 300      # print a health line at least this often, even when idle
