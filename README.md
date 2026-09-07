@@ -244,7 +244,7 @@ Content-Type: application/json
 {
   "events": [ { "type": "reception", "num": 3663953607, "ts": 1723900000, "...": "..." } ],
   "ingestor_node": 3663953607,
-  "ingestor_version": "1.3.7"
+  "ingestor_version": "1.4.3"
 }
 ```
 
