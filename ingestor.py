@@ -41,7 +41,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.4.3"     # bump on each release; logged at startup
+__version__ = "1.5.0"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 2         # upload cadence: smaller/more-frequent batches so the
                           # dashboard's live SSE stream trickles instead of chunking
@@ -56,10 +56,25 @@ SESSION_REBUILD_AFTER = 3 # consecutive failures before we throw away the HTTP s
 # container's restart policy starts a FRESH process — which re-resolves the host
 # and rebuilds the interface, exactly what a manual restart does. 0 disables it.
 RADIO_DOWN_EXIT_S = int(os.environ.get("RADIO_DOWN_EXIT_MIN", "5") or "5") * 60
+# feed watchdog: a socket can look perfectly alive while NO packets flow — a
+# half-open TCP to a MeshMonitor proxy or a shared node that quietly dropped us, a
+# wedged USB radio. The connection-error watchdog above never fires (there's no
+# error), so the ingestor "stays online" but ingests nothing. We fix that by
+# measuring ACTUAL packet flow: silent for this long → force a reconnect, and if
+# reconnecting doesn't restore the feed, restart the container. 0 disables it.
+# Keep it comfortably above the longest gap a healthy feed shows. A busy Meshtastic
+# mesh is never silent this long; MeshCore is far sparser so it gets a wider window.
+RX_IDLE_S = int(os.environ.get("RX_IDLE_RESTART_MIN", "10") or "10") * 60
+# MeshCore traffic is far sparser (a quiet mesh can be minutes between frames) AND
+# its library already auto-reconnects the transport, so its feed watchdog is a pure
+# last-resort with a much wider window — only genuinely-dead silence trips it.
+MC_RX_IDLE_S = RX_IDLE_S * 12 if RX_IDLE_S else 0
 
 events: "queue.Queue[dict]" = queue.Queue(maxsize=MAX_QUEUE)
 cfg = None
 self_num = None
+last_rx = 0.0            # wall time of the last packet actually received (feed watchdog)
+_mt_conn_lost = False    # set by the meshtastic 'connection.lost' pubsub event
 DEBUG = os.environ.get("DEBUG") == "1"
 
 # running totals for the periodic [status] line and for debugging
@@ -327,10 +342,22 @@ def real_position(lat, lon) -> bool:
 # ====================================================================
 
 def mt_on_receive(packet, interface):  # noqa: ANN001 - meshtastic pubsub signature
+    # ANY packet from the radio proves the feed is alive — even our own echo or a
+    # packet we filter out. The feed watchdog keys off this timestamp.
+    global last_rx
+    last_rx = time.time()
     try:
         mt_handle_packet(packet)
     except Exception as exc:
         warn(f"failed to handle packet: {exc}")
+
+
+def mt_on_conn_lost(*_args, **_kwargs) -> None:
+    """The meshtastic library fires 'meshtastic.connection.lost' from its reader
+    thread when the link drops. Flag it so the main loop reconnects at once instead
+    of spinning obliviously until something else notices."""
+    global _mt_conn_lost
+    _mt_conn_lost = True
 
 
 def mt_hops(packet: dict):
@@ -606,6 +633,28 @@ def mt_connect(conn: str | None):
     return meshtastic.serial_interface.SerialInterface(devPath=target or None)
 
 
+def mt_enable_keepalive(iface) -> None:
+    """Turn on OS-level TCP keepalive on the interface's socket so a vanished peer
+    (a MeshMonitor proxy or shared node that dropped us, a NAT/idle timeout) surfaces
+    as a real socket error in ~2 min — which makes the library fire 'connection.lost'
+    — instead of a recv() that blocks forever. The meshtastic TCPInterface never sets
+    this, which is the root of the 'still online but ingesting nothing' hangs.
+    Best-effort and platform-guarded; a no-op for serial/BLE (no .socket)."""
+    sock = getattr(iface, "socket", None)
+    if sock is None:
+        return
+    try:
+        import socket as _sock
+        sock.setsockopt(_sock.SOL_SOCKET, _sock.SO_KEEPALIVE, 1)
+        # Linux tuning: first probe after 60s idle, repeat every 15s, give up after 4
+        # (≈2 min to detect a dead peer). Each knob is optional across platforms.
+        for name, val in (("TCP_KEEPIDLE", 60), ("TCP_KEEPINTVL", 15), ("TCP_KEEPCNT", 4)):
+            if hasattr(_sock, name):
+                sock.setsockopt(_sock.IPPROTO_TCP, getattr(_sock, name), val)
+    except Exception as exc:
+        dbg(f"could not set TCP keepalive (harmless): {exc}")
+
+
 # Meshtastic modem preset -> the name an UNNAMED primary channel shows in the
 # app (an empty primary on LONG_FAST is "LongFast"). Lets ALLOWED_CHANNELS match
 # by name even though the packet only carries the channel index.
@@ -644,34 +693,71 @@ def mt_load_channels(iface) -> None:
 
 
 def run_meshtastic() -> None:
-    global self_num
+    global self_num, last_rx, _mt_conn_lost
     from pubsub import pub
     pub.subscribe(mt_on_receive, "meshtastic.receive")
+    pub.subscribe(mt_on_conn_lost, "meshtastic.connection.lost")
 
-    last_good = time.time()   # last time the radio was healthily connected
+    iface = None
+    last_good = time.time()   # last time we had a WORKING connection (drives the exit watchdog)
+    stalls = 0                # consecutive feed-idle reconnects that never got a packet
     while True:
         try:
+            _mt_conn_lost = False
             iface = mt_connect(cfg.connection)
+            mt_enable_keepalive(iface)     # OS detects a dead/half-open TCP peer
             info = iface.getMyNodeInfo() or {}
             self_num = info.get("num")
             log(f"[ok] meshtastic connected, this node: {self_num}")
-            last_good = time.time()
+            now0 = time.time()
+            last_good = now0
+            last_rx = now0                 # fresh link: start the silence clock now
+            connected_at = now0
             mt_load_channels(iface)        # resolve channel names for filtering
             mt_seed_nodedb(iface)
             mt_self_report(iface)          # report our own health right away
-            last_self = time.time()
-            last_seed = time.time()
+            last_self = now0
+            last_seed = now0
             while True:
                 now_t = time.time()
                 last_good = now_t          # inner loop only runs while connected
+                # (1) the library reported the link dropped → reconnect immediately
+                if _mt_conn_lost:
+                    raise ConnectionError("connection lost (reported by the radio link)")
+                # (2) feed watchdog: the socket looks up but no packets are arriving.
+                # Silent past the window → tear down and reconnect. If we never heard a
+                # single packet since connecting, the SOURCE is dead (not just this
+                # socket); count those and restart the whole container after a few.
+                idle = now_t - last_rx
+                if RX_IDLE_S and idle > RX_IDLE_S:
+                    # reconnect first (fixes a wedged/half-open socket). Escalate to a
+                    # full container restart only after ~1 h of UNBROKEN silence across
+                    # reconnects — clearly a dead feed, not just a momentarily quiet
+                    # mesh, so the rare quiet-mesh operator never gets a restart loop.
+                    stalls = stalls + 1 if last_rx <= connected_at else 1
+                    if stalls * RX_IDLE_S >= 3600:
+                        flush_and_exit(f"no packets for {int(idle)}s across {stalls} reconnects"
+                                       f" (feed stalled); restarting container")
+                    warn(f"no packets for {int(idle)}s though the link looks up;"
+                         f" reconnecting (feed stall {stalls})")
+                    break
                 if now_t - last_self > 300:   # refresh listener health every 5 min
                     mt_self_report(iface)
                     last_self = now_t
                 if now_t - last_seed > 3600:  # re-forward the radio's phonebook every
                     mt_seed_nodedb(iface, names_only=True)   # hour: fill in names/
                     last_seed = now_t                        # roles the radio has since learned
-                time.sleep(30)             # pubsub callbacks do the packet work
+                time.sleep(5)              # pubsub callbacks do the packet work; poll often
+            try:                           # tidy teardown before we loop back to reconnect
+                iface.close()
+            except Exception:
+                pass
         except KeyboardInterrupt:
+            try:
+                if iface:
+                    iface.close()
+            except Exception:
+                pass
             return
         except Exception as exc:
             down_s = int(time.time() - last_good)
@@ -763,7 +849,7 @@ def run_meshcore() -> None:
 
 
 async def mc_main() -> None:
-    global self_num
+    global self_num, last_rx
     from meshcore import MeshCore, EventType
 
     kind, target = parse_connection(cfg.connection, default_tcp_port=5000)
@@ -845,6 +931,7 @@ async def mc_main() -> None:
             self_num = mc_num(self_key)
             log(f"[ok] meshcore connected, this node: {self_num}")
             last_good = time.time()
+            last_rx = time.time()          # fresh link: start the (wide) silence clock
             if real_position(info.get("adv_lat"), info.get("adv_lon")):
                 put({"type": "position", "num": self_num, "ts": int(time.time()),
                      "lat": info["adv_lat"], "lon": info["adv_lon"]})
@@ -1027,7 +1114,18 @@ async def mc_main() -> None:
             # shows up quickly; poll battery only every 10th tick (~10 min).
             tick = 0
             while True:
-                last_good = time.time()    # inner loop only runs while connected
+                now_t = time.time()
+                last_good = now_t          # inner loop only runs while connected
+                # feed watchdog: any frame heard this window — including our own
+                # advert reflected back (self_adv) — proves the link is alive. If the
+                # radio goes truly silent past the (wide) MeshCore window, the feed is
+                # wedged; restart the container for a clean reconnect. auto_reconnect
+                # handles transport blips, so this is the last-resort safety net.
+                if heard["peers"] or heard["chan_msg"] or heard["dm_msg"] or heard["self_adv"]:
+                    last_rx = now_t
+                if MC_RX_IDLE_S and now_t - last_rx > MC_RX_IDLE_S:
+                    flush_and_exit(f"meshcore: no frames for {int(now_t - last_rx)}s"
+                                   f" (feed stalled); restarting container")
                 if tick % 10 == 0:
                     try:
                         res = await mc.commands.get_bat()

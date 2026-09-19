@@ -95,6 +95,7 @@ services:
       PROTOCOL: "meshtastic"                           # meshtastic (default) or meshcore
       ALLOWED_CHANNELS: "MediumFast"                   # only forward these channel NAMES (blank = all)
       RADIO_DOWN_EXIT_MIN: "5"                          # watchdog: restart if the radio is unreachable this long (0 = off)
+      RX_IDLE_RESTART_MIN: "10"                         # feed watchdog: reconnect if no packets are heard this long (0 = off)
       DEBUG: "0"                                        # 1 = verbose; the failure hints still show at 0
     logging:                                           # cap the on-disk log (optional, recommended)
       driver: json-file
@@ -188,6 +189,7 @@ Only the first three are required.
 | --- | --- | --- |
 | `INGESTOR_NODE_ID` | auto | Pin this listener's own node id when the radio can't report it. Use the radio's id, for example `!cc384cc7`, or a plain number. Auto-detection handles this on its own in almost every case. |
 | `RADIO_DOWN_EXIT_MIN` | `5` | Radio watchdog. If the radio can't be reconnected for this many minutes, the ingestor exits so the container restarts fresh (see below). Set `0` to turn it off. |
+| `RX_IDLE_RESTART_MIN` | `10` | Feed watchdog. If no packets are heard for this many minutes even though the connection looks up, reconnect (and restart the container if that doesn't help). See below. Raise it or set `0` only for a mesh so quiet it can go this long between packets. |
 | `RX_ONLY` | unset | A no-op. The ingestor only ever listens. It is read only so an older config that still sets this keeps working. |
 | `MESH_PROTOCOL` | unset | Older name for `PROTOCOL`. Still read if present. |
 
@@ -207,6 +209,28 @@ connection from scratch: the same thing a manual restart does, done for you.
 This only works if the container has a restart policy. The compose example
 above sets `restart: unless-stopped`; keep it. To disable the watchdog, set
 `RADIO_DOWN_EXIT_MIN: "0"`.
+
+### Feed watchdog
+
+The radio watchdog above catches a connection that *errors*. But a connection can
+also go silent while still looking alive: a half-open TCP link to a MeshMonitor
+proxy or a shared node that quietly dropped you, or a wedged USB radio. No error is
+ever raised, so the old ingestor would sit there "connected," reporting itself
+online, while ingesting nothing, until someone noticed the stats had gone to zero.
+
+The feed watchdog fixes that by watching actual packet flow, three ways: it turns
+on TCP keepalive so a vanished peer surfaces as a real error in about two minutes;
+it reacts at once when the library reports the link lost; and if packets simply
+stop arriving for `RX_IDLE_RESTART_MIN` minutes (default 10) it reconnects on its
+own, restarting the container if reconnecting doesn't bring the feed back. It keys
+on any packet at all, so a busy mesh never trips it; only raise it (or set `0`) if
+your mesh is quiet enough to legitimately go that long between packets. MeshCore is
+sparser, so it uses a much wider window automatically.
+
+**On MeshMonitor / virtual-node setups:** going *through* a proxy is the most common
+source of these silent stalls. Where you can, point `CONNECTION` straight at the
+radio (its TCP `host:4403`, or serial) so there's no proxy to go half-open. The feed
+watchdog is the safety net for when you can't.
 
 ## Packet filters
 
