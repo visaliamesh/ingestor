@@ -41,7 +41,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.5.1"     # bump on each release; logged at startup
+__version__ = "1.5.2"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 2         # upload cadence: smaller/more-frequent batches so the
                           # dashboard's live SSE stream trickles instead of chunking
@@ -352,10 +352,13 @@ def mt_on_receive(packet, interface):  # noqa: ANN001 - meshtastic pubsub signat
         warn(f"failed to handle packet: {exc}")
 
 
-def mt_on_conn_lost(*_args, **_kwargs) -> None:
+def mt_on_conn_lost(interface=None) -> None:  # noqa: ANN001 - meshtastic pubsub signature
     """The meshtastic library fires 'meshtastic.connection.lost' from its reader
     thread when the link drops. Flag it so the main loop reconnects at once instead
-    of spinning obliviously until something else notices."""
+    of spinning obliviously until something else notices. The signature MUST match
+    the publisher exactly — pub.sendMessage(..., interface=self) — so pypubsub's
+    topic arg spec accepts it; a `*args`/`**kwargs` listener trips
+    SenderUnknownMsgDataError on every disconnect."""
     global _mt_conn_lost
     _mt_conn_lost = True
 
