@@ -41,7 +41,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.5.0"     # bump on each release; logged at startup
+__version__ = "1.5.1"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 2         # upload cadence: smaller/more-frequent batches so the
                           # dashboard's live SSE stream trickles instead of chunking
@@ -932,6 +932,23 @@ async def mc_main() -> None:
             log(f"[ok] meshcore connected, this node: {self_num}")
             last_good = time.time()
             last_rx = time.time()          # fresh link: start the (wide) silence clock
+            # Publish OUR OWN node's identity. MeshCore never lists the self node in
+            # its contact roster, so without this the ingestor's own node shows up
+            # nameless, no preset, wrong role (Meshtastic gets this from
+            # mt_self_report). SELF_INFO names it `name` (contacts use `adv_name`);
+            # tolerate either. radio_sf/bw/cr build the same "SF7/BW62/CR5" preset
+            # string the rest of the mesh reports (bw is kHz -> int drops the .5).
+            if self_num is not None:
+                sf, bw, cr = info.get("radio_sf"), info.get("radio_bw"), info.get("radio_cr")
+                mc_preset = (f"SF{int(sf)}/BW{int(bw)}/CR{int(cr)}"
+                             if None not in (sf, bw, cr) else None)
+                mc_name = info.get("name") or info.get("adv_name") or None
+                put({"type": "nodeinfo", "num": self_num, "ts": int(time.time()),
+                     "node_id": f"!{self_key[:8].lower()}",
+                     "long_name": mc_name,
+                     "short_name": (mc_name or "")[:4] or None,
+                     "role": MC_ROLES.get(info.get("adv_type", info.get("type")), "COMPANION"),
+                     "modem_preset": mc_preset})
             if real_position(info.get("adv_lat"), info.get("adv_lon")):
                 put({"type": "position", "num": self_num, "ts": int(time.time()),
                      "lat": info["adv_lat"], "lon": info["adv_lon"]})
