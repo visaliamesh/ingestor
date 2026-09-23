@@ -41,7 +41,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.5.2"     # bump on each release; logged at startup
+__version__ = "1.5.3"     # bump on each release; logged at startup
 
 FLUSH_SECONDS = 2         # upload cadence: smaller/more-frequent batches so the
                           # dashboard's live SSE stream trickles instead of chunking
@@ -1046,9 +1046,23 @@ async def mc_main() -> None:
                     heard["self_adv"] += 1
                     return   # our own advert, echoed back by a neighbor: not a reception
                 heard["peers"].add(num)
-                if str(key)[:12].lower() not in contacts_by_prefix:
-                    put({"type": "nodeinfo", "num": num, "ts": ts,
-                         "node_id": f"!{str(key)[:8].lower()}"})
+                # An advert carries the node's NAME, ROLE and POSITION in its appdata
+                # (the parser exposes adv_name, adv_type=flags&0x0F, adv_lat/lon). Use
+                # them so a node we hear DIRECTLY is named/typed/placed immediately,
+                # instead of staying a bare !hex until it turns up in the contact
+                # roster. adv_type is already the 4-bit role (1 Companion/2 Repeater/
+                # 3 Room Server/4 Sensor).
+                adv_name = (p.get("adv_name") or "").strip() or None
+                adv_role = MC_ROLES.get(p.get("adv_type")) if p.get("adv_type") is not None else None
+                if adv_name or adv_role or str(key)[:12].lower() not in contacts_by_prefix:
+                    ni = {"type": "nodeinfo", "num": num, "ts": ts,
+                          "node_id": f"!{str(key)[:8].lower()}"}
+                    if adv_name:
+                        ni["long_name"] = adv_name
+                        ni["short_name"] = adv_name[:4]
+                    if adv_role:
+                        ni["role"] = adv_role
+                    put(ni)
                 lat, lon = p.get("adv_lat"), p.get("adv_lon")
                 if real_position(lat, lon):
                     put({"type": "position", "num": num, "ts": ts, "lat": lat, "lon": lon})
